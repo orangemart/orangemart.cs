@@ -10,7 +10,7 @@ using Oxide.Core.Libraries.Covalence;
 
 namespace Oxide.Plugins
 {
-    [Info("Orangemart", "saulteafarmer", "0.1.0")]
+    [Info("Orangemart", "saulteafarmer", "0.2.0")]
     [Description("Allows players to buy and sell in-game units and VIP status using Bitcoin Lightning Network payments")]
     public class Orangemart : CovalencePlugin
     {
@@ -24,12 +24,17 @@ namespace Oxide.Plugins
         private string CurrencyName;
         private int SatsPerCurrencyUnit;
         private int PricePerCurrencyUnit;
+        private string DiscordChannelName; // Added missing configuration variable
+        private ulong CurrencySkinID;
 
         // Transaction timing settings (moved to config)
         private int CheckIntervalSeconds;
         private int InvoiceTimeoutSeconds;
         private int RetryDelaySeconds;
         private int MaxRetries;
+
+        // Blacklisted domains
+        private List<string> BlacklistedDomains = new List<string>();
 
         // File names
         private const string SellLogFile = "Orangemart/sell_log.json";
@@ -41,6 +46,11 @@ namespace Oxide.Plugins
 
         private List<PendingInvoice> pendingInvoices = new List<PendingInvoice>();
         private Dictionary<string, int> retryCounts = new Dictionary<string, int>();
+
+        // Added for handling 404-specific retries
+        private Dictionary<string, int> retryCounts404 = new Dictionary<string, int>();
+        private const int Max404Retries = 5;
+        private const int RetryDelaySeconds404 = 5;
 
         private class LNDHubConfig
         {
@@ -164,8 +174,9 @@ namespace Oxide.Plugins
                     SaveConfig();
                 }
 
-                string lndhubConnectionString = Config["LNDHubConnection"]?.ToString();
-                string discordWebhookUrl = Config["DiscordWebhookUrl"]?.ToString();
+                // Access LNDHubConnection from the InvoiceSettings section
+                string lndhubConnectionString = (Config["InvoiceSettings"] as Dictionary<string, object>)?["LNDHubConnection"]?.ToString();
+                string discordWebhookUrl = (Config["Discord"] as Dictionary<string, object>)?["DiscordWebhookUrl"]?.ToString();
 
                 if (string.IsNullOrEmpty(lndhubConnectionString))
                 {
@@ -176,22 +187,33 @@ namespace Oxide.Plugins
                 config = LNDHubConfig.ParseLNDHubConnection(lndhubConnectionString);
                 config.DiscordWebhookUrl = discordWebhookUrl;
 
-                // Load configuration settings
-                CurrencyItemID = Convert.ToInt32(Config["CurrencyItemID"] ?? 1776460938);
-                BuyCurrencyCommandName = Config["BuyCurrencyCommandName"]?.ToString() ?? "buyblood";
-                SendCurrencyCommandName = Config["SendCurrencyCommandName"]?.ToString() ?? "sendblood";
-                BuyVipCommandName = Config["BuyVipCommandName"]?.ToString() ?? "buyvip";
-                VipPrice = Convert.ToInt32(Config["VipPrice"] ?? 1000);
-                VipPermissionGroup = Config["VipPermissionGroup"]?.ToString() ?? "vip";
-                CurrencyName = Config["CurrencyName"]?.ToString() ?? "blood";
-                SatsPerCurrencyUnit = Convert.ToInt32(Config["SatsPerCurrencyUnit"] ?? 1);
-                PricePerCurrencyUnit = Convert.ToInt32(Config["PricePerCurrencyUnit"] ?? 1);
+                // Load other configuration settings...
+                var currencySettings = Config["CurrencySettings"] as Dictionary<string, object>;
+                CurrencyItemID = Convert.ToInt32(currencySettings?["CurrencyItemID"] ?? 1776460938);
+                CurrencyName = currencySettings?["CurrencyName"]?.ToString() ?? "blood";
+                SatsPerCurrencyUnit = Convert.ToInt32(currencySettings?["SatsPerCurrencyUnit"] ?? 1);
+                PricePerCurrencyUnit = Convert.ToInt32(currencySettings?["PricePerCurrencyUnit"] ?? 1);
+                CurrencySkinID = (ulong)Convert.ToInt64(currencySettings?["CurrencySkinID"] ?? 0);
 
-                // Load transaction timing settings from config
-                CheckIntervalSeconds = Convert.ToInt32(Config["CheckIntervalSeconds"] ?? 10);
-                InvoiceTimeoutSeconds = Convert.ToInt32(Config["InvoiceTimeoutSeconds"] ?? 300);
-                RetryDelaySeconds = Convert.ToInt32(Config["RetryDelaySeconds"] ?? 10);
-                MaxRetries = Convert.ToInt32(Config["MaxRetries"] ?? 25);
+                var commandsSettings = Config["Commands"] as Dictionary<string, object>;
+                BuyCurrencyCommandName = commandsSettings?["BuyCurrencyCommandName"]?.ToString() ?? "buyblood";
+                SendCurrencyCommandName = commandsSettings?["SendCurrencyCommandName"]?.ToString() ?? "sendblood";
+                BuyVipCommandName = commandsSettings?["BuyVipCommandName"]?.ToString() ?? "buyvip";
+
+                var vipSettings = Config["VIPSettings"] as Dictionary<string, object>;
+                VipPrice = Convert.ToInt32(vipSettings?["VipPrice"] ?? 1000);
+                VipPermissionGroup = vipSettings?["VipPermissionGroup"]?.ToString() ?? "vip";
+
+                // Load DiscordChannelName from Discord section
+                DiscordChannelName = (Config["Discord"] as Dictionary<string, object>)?["DiscordChannelName"]?.ToString() ?? "mart";
+
+                // Load invoice settings
+                var invoiceSettings = Config["InvoiceSettings"] as Dictionary<string, object>;
+                CheckIntervalSeconds = Convert.ToInt32(invoiceSettings?["CheckIntervalSeconds"] ?? 10);
+                InvoiceTimeoutSeconds = Convert.ToInt32(invoiceSettings?["InvoiceTimeoutSeconds"] ?? 300);
+                RetryDelaySeconds = Convert.ToInt32(invoiceSettings?["RetryDelaySeconds"] ?? 10);
+                MaxRetries = Convert.ToInt32(invoiceSettings?["MaxRetries"] ?? 25);
+                BlacklistedDomains = (invoiceSettings?["BlacklistedDomains"] as List<object>)?.ConvertAll(d => d.ToString().ToLower()) ?? new List<string>();
             }
             catch (Exception ex)
             {
@@ -201,24 +223,44 @@ namespace Oxide.Plugins
 
         protected override void LoadDefaultConfig()
         {
-            Config["LNDHubConnection"] = "lndhub://admin:password@sats.love/";
-            Config["DiscordWebhookUrl"] = "https://discord.com/api/webhooks/your_webhook_url";
-            Config["CurrencyItemID"] = 1776460938;
-            Config["BuyCurrencyCommandName"] = "buyblood";
-            Config["SendCurrencyCommandName"] = "sendblood";
-            Config["BuyVipCommandName"] = "buyvip";
-            Config["VipPrice"] = 1000; // Default price for VIP
-            Config["VipPermissionGroup"] = "vip";
-            Config["CurrencyName"] = "blood";
-            Config["SatsPerCurrencyUnit"] = 1; // Default value
-            Config["PricePerCurrencyUnit"] = 1; // Default value
+            Config["Commands"] = new Dictionary<string, object>
+            {
+                ["BuyCurrencyCommandName"] = "buyblood",
+                ["BuyVipCommandName"] = "buyvip",
+                ["SendCurrencyCommandName"] = "sendblood"
+            };
 
-            // Default transaction timing settings
-            Config["CheckIntervalSeconds"] = 10;
-            Config["InvoiceTimeoutSeconds"] = 300;
-            Config["RetryDelaySeconds"] = 10;
-            Config["MaxRetries"] = 25;
-        }
+            Config["Discord"] = new Dictionary<string, object>
+            {
+                ["DiscordChannelName"] = "mart",
+                ["DiscordWebhookUrl"] = "https://discord.com/api/webhooks/your_webhook_url"
+            };
+
+            Config["InvoiceSettings"] = new Dictionary<string, object>
+            {
+                ["BlacklistedDomains"] = new List<string> { "example.com", "blacklisted.net" },
+                ["CheckIntervalSeconds"] = 10,
+                ["InvoiceTimeoutSeconds"] = 300,
+                ["LNDHubConnection"] = "lndhub://admin:password@sats.love/",
+                ["MaxRetries"] = 25,
+                ["RetryDelaySeconds"] = 10
+            };
+
+            Config["VIPSettings"] = new Dictionary<string, object>
+            {
+                ["VipPermissionGroup"] = "vip",
+                ["VipPrice"] = 1000
+            };
+
+            Config["CurrencySettings"] = new Dictionary<string, object>
+            {
+                ["CurrencyItemID"] = 1776460938,
+                ["CurrencyName"] = "blood",
+                ["PricePerCurrencyUnit"] = 1,
+                ["SatsPerCurrencyUnit"] = 1,
+                ["CurrencySkinID"] = 0
+            };
+        }        
 
         private void Init()
         {
@@ -248,6 +290,7 @@ namespace Oxide.Plugins
         {
             pendingInvoices.Clear();
             retryCounts.Clear();
+            retryCounts404.Clear(); // Clear 404-specific retries
             authToken = null;
         }
 
@@ -271,7 +314,8 @@ namespace Oxide.Plugins
                 ["FailedToFindBasePlayer"] = "Failed to find base player object for player {0}.",
                 ["FailedToCreateCurrencyItem"] = "Failed to create {0} item for player {1}.",
                 ["AddedToVipGroup"] = "Player {0} added to VIP group '{1}'.",
-                ["InvoiceExpired"] = "Your invoice for {0} sats has expired. Please try again." // New message for expired invoice
+                ["InvoiceExpired"] = "Your invoice for {0} sats has expired. Please try again.",
+                ["BlacklistedDomain"] = "The domain '{0}' is currently blacklisted. Please use a different Lightning address."
             }, this);
         }
 
@@ -385,7 +429,58 @@ namespace Oxide.Plugins
                 {
                     PrintError($"Error checking invoice status: HTTP {code} (Not Found)");
                     PrintWarning($"Ensure the correct rHash: {rHash}");
-                    callback(false, false);
+
+                    // Initialize retry count for 404 if not present
+                    if (!retryCounts404.ContainsKey(rHash))
+                    {
+                        retryCounts404[rHash] = 1;
+                    }
+                    else
+                    {
+                        retryCounts404[rHash]++;
+                    }
+
+                    // Check if retry count has exceeded the maximum allowed retries (5)
+                    if (retryCounts404[rHash] <= Max404Retries)
+                    {
+                        PrintWarning($"Retrying invoice {rHash}. Attempt {retryCounts404[rHash]} of {Max404Retries}.");
+
+                        // Schedule a retry after 5 seconds
+                        timer.Once(RetryDelaySeconds404, () =>
+                        {
+                            CheckInvoicePaid(rHash, callback);
+                        });
+                    }
+                    else
+                    {
+                        PrintWarning($"Max retries reached for invoice {rHash}. Marking as failed.");
+
+                        // Remove the retry count as we've exceeded the max retries
+                        retryCounts404.Remove(rHash);
+
+                        // Optionally, notify the player about the failed payment
+                        var invoice = pendingInvoices.Find(inv => inv.RHash == rHash);
+                        if (invoice != null)
+                        {
+                            pendingInvoices.Remove(invoice);
+                            invoice.Player.Reply(Lang("InvoiceExpired", invoice.Player.Id, invoice.Amount));
+
+                            var logEntry = new BuyInvoiceLogEntry
+                            {
+                                SteamID = invoice.Player.Id,
+                                InvoiceID = invoice.RHash,
+                                IsPaid = false,
+                                Timestamp = DateTime.UtcNow,
+                                Amount = invoice.Amount,
+                                CurrencyGiven = invoice.Type == PurchaseType.Currency,
+                                VipGranted = invoice.Type == PurchaseType.Vip
+                            };
+                            LogBuyInvoice(logEntry);
+                        }
+
+                        // Finally, mark the payment as failed
+                        callback(false, false);
+                    }
                     return;
                 }
 
@@ -402,11 +497,22 @@ namespace Oxide.Plugins
 
                     if (jsonResponse != null && jsonResponse.ContainsKey("paid"))
                     {
-                        bool isPaid = (bool)jsonResponse["paid"];
-                        bool isPending = jsonResponse.ContainsKey("status") && jsonResponse["status"].ToString() == "pending";
+                        bool isPaid = Convert.ToBoolean(jsonResponse["paid"]);
+                        bool isPending = jsonResponse.ContainsKey("status") && jsonResponse["status"].ToString().ToLower() == "pending";
 
                         if (isPaid)
                         {
+                            // Remove retry counts (both general and 404-specific) on successful payment
+                            if (retryCounts.ContainsKey(rHash))
+                            {
+                                retryCounts.Remove(rHash);
+                            }
+
+                            if (retryCounts404.ContainsKey(rHash))
+                            {
+                                retryCounts404.Remove(rHash);
+                            }
+
                             callback(true, false);
                         }
                         else if (isPending)
@@ -415,6 +521,7 @@ namespace Oxide.Plugins
                         }
                         else
                         {
+                            // For other statuses, you might want to handle them differently
                             callback(false, false);
                         }
                     }
@@ -503,8 +610,47 @@ namespace Oxide.Plugins
 
             string lightningAddress = args[1];
 
+            // Check if the Lightning address is from a blacklisted domain
+            if (IsLightningAddressBlacklisted(lightningAddress))
+            {
+                string domain = GetDomainFromLightningAddress(lightningAddress);
+                player.Reply(Lang("BlacklistedDomain", player.Id, domain));
+                return;
+            }
+
             var basePlayer = player.Object as BasePlayer;
-            int currencyAmount = basePlayer.inventory.GetAmount(CurrencyItemID);
+            if (basePlayer == null)
+            {
+                player.Reply(Lang("FailedToFindBasePlayer", player.Id, player.Name));
+                return;
+            }
+
+            int currencyAmount = 0;
+
+            // If CurrencySkinID is defined and greater than 0, only check for items with that skin ID
+            if (CurrencySkinID > 0)
+            {
+                var itemsWithSkin = basePlayer.inventory.FindItemsByItemID(CurrencyItemID);
+                foreach (var item in itemsWithSkin)
+                {
+                    if (item.skin == CurrencySkinID)
+                    {
+                        currencyAmount += item.amount;
+                    }
+                }
+
+                // If no matching items were found, inform the player and stop
+                if (currencyAmount == 0)
+                {
+                    player.Reply($"You do not have any {CurrencyName} with the required skin ID.");
+                    return;
+                }
+            }
+            else
+            {
+                // Check for all items with the given CurrencyItemID regardless of skin
+                currencyAmount = basePlayer.inventory.GetAmount(CurrencyItemID);
+            }
 
             if (currencyAmount < amount)
             {
@@ -513,7 +659,7 @@ namespace Oxide.Plugins
             }
 
             // Reserve the currency by immediately removing it from the player's inventory
-            int reservedAmount = ReserveCurrency(basePlayer, amount);
+            int reservedAmount = ReserveCurrencyWithSkin(basePlayer, amount);
             if (reservedAmount == 0)
             {
                 player.Reply(Lang("FailedToReserveCurrency", player.Id));
@@ -562,6 +708,47 @@ namespace Oxide.Plugins
             });
         }
 
+        // Helper method to reserve currency with the specific skin ID
+        private int ReserveCurrencyWithSkin(BasePlayer player, int amount)
+        {
+            var items = player.inventory.FindItemsByItemID(CurrencyItemID);
+            int remaining = amount;
+            int reserved = 0;
+
+            foreach (var item in items)
+            {
+                // Check if the item matches the defined CurrencySkinID, if applicable
+                if (CurrencySkinID > 0 && item.skin != CurrencySkinID)
+                {
+                    continue; // Skip items without the defined skin ID
+                }
+
+                if (item.amount > remaining)
+                {
+                    item.UseItem(remaining);
+                    reserved += remaining;
+                    remaining = 0;
+                    break;
+                }
+                else
+                {
+                    reserved += item.amount;
+                    remaining -= item.amount;
+                    item.Remove();
+                }
+            }
+
+            if (remaining > 0)
+            {
+                // Rollback if unable to remove the full amount
+                PrintWarning($"Could not reserve the full amount of {CurrencyName}. {remaining} remaining.");
+                ReturnCurrency(player, reserved); // Return whatever was taken
+                return 0; // Indicate failure to reserve
+            }
+
+            return reserved; // Return the amount actually reserved
+        }
+
         private void CmdBuyCurrency(IPlayer player, string command, string[] args)
         {
             if (!player.HasPermission("orangemart.buycurrency"))
@@ -586,7 +773,7 @@ namespace Oxide.Plugins
                     SendInvoiceToDiscord(player, invoiceResponse.PaymentRequest, amountSats, $"Buying {amount} {CurrencyName}");
 
                     // Notify the player in chat to check the Discord channel
-                    player.Reply(Lang("InvoiceCreatedCheckDiscord", player.Id, "buycurrency"));
+                    player.Reply(Lang("InvoiceCreatedCheckDiscord", player.Id, DiscordChannelName));
 
                     // Add the pending invoice
                     var pendingInvoice = new PendingInvoice
@@ -652,7 +839,7 @@ namespace Oxide.Plugins
                     SendInvoiceToDiscord(player, invoiceResponse.PaymentRequest, amountSats, $"Buying VIP Status");
 
                     // Notify the player in chat to check the Discord channel
-                    player.Reply(Lang("InvoiceCreatedCheckDiscord", player.Id, "buyvip"));
+                    player.Reply(Lang("InvoiceCreatedCheckDiscord", player.Id, DiscordChannelName));
 
                     // Add the pending invoice
                     var pendingInvoice = new PendingInvoice
@@ -698,6 +885,27 @@ namespace Oxide.Plugins
                     player.Reply(Lang("FailedToCreateInvoice", player.Id));
                 }
             });
+        }
+
+        private bool IsLightningAddressBlacklisted(string lightningAddress)
+        {
+            string domain = GetDomainFromLightningAddress(lightningAddress);
+            if (string.IsNullOrEmpty(domain))
+                return false;
+
+            return BlacklistedDomains.Contains(domain.ToLower());
+        }
+
+        private string GetDomainFromLightningAddress(string lightningAddress)
+        {
+            if (string.IsNullOrEmpty(lightningAddress))
+                return null;
+
+            var parts = lightningAddress.Split('@');
+            if (parts.Length != 2)
+                return null;
+
+            return parts[1].ToLower();
         }
 
         private void QueryLightningAddressForInvoice(string lightningAddress, int satsAmount, Action<string> callback)
@@ -936,8 +1144,13 @@ namespace Oxide.Plugins
                 var currencyItem = ItemManager.CreateByItemID(CurrencyItemID, amount);
                 if (currencyItem != null)
                 {
+                    if (CurrencySkinID > 0) // Check if a skinID is defined and apply it
+                    {
+                        currencyItem.skin = (ulong)CurrencySkinID;
+                    }
+
                     basePlayer.GiveItem(currencyItem);
-                    Puts($"Gave {amount} {CurrencyName} to player {player.Id}.");
+                    Puts($"Gave {amount} {CurrencyName} (skinID: {CurrencySkinID}) to player {player.Id}.");
                 }
                 else
                 {
