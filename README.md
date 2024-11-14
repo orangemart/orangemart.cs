@@ -27,39 +27,125 @@ The following commands are available to players:
 
 ---
 
+# Orangemart Plugin Configuration
+
+Below is a comprehensive list of key configuration variables that can be customized in the **Orangemart** plugin. 
+These settings allow you to tailor the plugin's behavior to fit your server's requirements.
+
 ## Configuration
 
-Below is a list of key configuration variables that can be customized in the plugin:
+#### Commands
 
-- **`CurrencyItemID`**  
-  The item ID used for in-game currency transactions.
+- **`BuyCurrencyCommandName`**
+  - The command players use to purchase in-game currency. For example, `/buyblood`.
 
-- **`BuyCurrencyCommandName`**  
-  The name of the command players use to buy in-game currency.
+- **`SendCurrencyCommandName`**
+  - The command players use to send in-game currency to other players. For example, `/sendblood`.
 
-- **`SendCurrencyCommandName`**  
-  The name of the command players use to send in-game currency to other players.
+- **`BuyVipCommandName`**
+  - The command players use to purchase VIP status. For example, `/buyvip`.
 
-- **`BuyVipCommandName`**  
-  The name of the command players use to purchase VIP status.
+#### Currency Settings
 
-- **`VipPrice`**  
-  The price (in satoshis) for players to purchase VIP status.
+- **`CurrencyItemID`**
+  - The item ID used for in-game currency transactions.
 
-- **`VipPermissionGroup`**  
-  The Oxide permission group that VIP players are added to.
+- **`CurrencyName`**
+  - The name of the in-game currency displayed to players.
 
-- **`CurrencyName`**  
-  The name of the in-game currency.
+- **`CurrencySkinID`**
+  - The skin ID applied to the in-game currency items. Set to `0` for default skin.
 
-- **`SatsPerCurrencyUnit`**  
-  The conversion rate between satoshis and in-game currency units.
+- **`SatsPerCurrencyUnit`**
+  - The conversion rate between satoshis and in-game currency units. Determines how many satoshis equal one unit of in-game currency.
 
-- **`PricePerCurrencyUnit`**  
-  The price (in satoshis) per unit of in-game currency.
+- **`PricePerCurrencyUnit`**
+  - The price (in satoshis) per unit of in-game currency.
 
-- **`CheckIntervalSeconds`**  
-  Interval time (in seconds) for checking pending Bitcoin transactions.
+#### Discord Integration
+
+- **`DiscordChannelName`**
+  - The name of the Discord channel where payment invoices will be posted.
+
+- **`DiscordWebhookUrl`**
+  - The Discord webhook URL used to send invoice notifications to the specified channel.
+
+#### Invoice Settings
+
+- **`BlacklistedDomains`**
+  - A list of domains that are disallowed for use in Lightning addresses. Players cannot send currency to addresses from these domains.
+
+- **`WhitelistedDomains`**
+  - A list of domains that are exclusively allowed for use in Lightning addresses. If this list is populated, only addresses from these domains are permitted.
+
+- **`CheckIntervalSeconds`**
+  - The interval time (in seconds) for checking pending Bitcoin transactions.
+
+- **`InvoiceTimeoutSeconds`**
+  - The time (in seconds) after which an unpaid invoice expires.
+
+- **`LNbitsApiKey`**
+  - The API key for authenticating with your LNbits instance.
+
+- **`LNbitsBaseUrl`**
+  - The base URL of your LNbits instance.
+
+- **`MaxRetries`**
+  - The maximum number of retry attempts for checking invoice payments before considering them expired.
+
+#### VIP Settings
+
+Configure the VIP status purchase and permissions.
+
+- **`VipPermissionGroup`**
+  - The Oxide permission group that players are added to upon purchasing VIP status.
+
+- **`VipPrice`**
+  - The price (in satoshis) for players to purchase VIP status.
+
+---
+
+### Example Configuration Snippet
+
+Here's how the configuration might look in your `config.json`:
+
+```
+{
+  "Commands": {
+    "BuyCurrencyCommandName": "buyblood",
+    "SendCurrencyCommandName": "sendblood",
+    "BuyVipCommandName": "buyvip"
+  },
+  "CurrencySettings": {
+    "CurrencyItemID": 1776460938,
+    "CurrencyName": "blood",
+    "CurrencySkinID": 0,
+    "PricePerCurrencyUnit": 1,
+    "SatsPerCurrencyUnit": 1
+  },
+  "Discord": {
+    "DiscordChannelName": "mart",
+    "DiscordWebhookUrl": "https://discord.com/api/webhooks/your_webhook_url"
+  },
+  "InvoiceSettings": {
+    "BlacklistedDomains": ["example.com", "blacklisted.net"],
+    "WhitelistedDomains": [],
+    "CheckIntervalSeconds": 10,
+    "InvoiceTimeoutSeconds": 300,
+    "LNbitsApiKey": "your-lnbits-admin-api-key",
+    "LNbitsBaseUrl": "https://your-lnbits-instance.com",
+    "MaxRetries": 25
+  },
+  "VIPSettings": {
+    "VipPermissionGroup": "vip",
+    "VipPrice": 1000
+  }
+}
+```
+
+**Note:**  
+- Ensure that all URLs and API keys are correctly set to match your server and LNbits configurations.
+- Adjust the `BlacklistedDomains` and `WhitelistedDomains` according to your server's policies regarding Lightning addresses.
 
 ---
 
