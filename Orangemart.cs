@@ -1,123 +1,113 @@
 using System;
 using System.Collections.Generic;
-using System.Text;
 using System.IO;
+using System.Linq;
 using Newtonsoft.Json;
 using Oxide.Core;
-using Oxide.Core.Plugins;
-using Oxide.Core.Libraries;
 using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.Libraries;
 
 namespace Oxide.Plugins
 {
-    [Info("Orangemart", "saulteafarmer", "0.2.0")]
-    [Description("Allows players to buy and sell in-game units and VIP status using Bitcoin Lightning Network payments")]
+    [Info("Orangemart", "saulteafarmer", "0.3.0")]
+    [Description("Allows players to buy and sell in-game units and VIP status using Bitcoin Lightning Network payments via LNbits")]
     public class Orangemart : CovalencePlugin
     {
-        // Configuration variables
-        private int CurrencyItemID;
-        private string BuyCurrencyCommandName;
-        private string SendCurrencyCommandName;
-        private string BuyVipCommandName;
-        private int VipPrice;
-        private string VipPermissionGroup;
-        private string CurrencyName;
-        private int SatsPerCurrencyUnit;
-        private int PricePerCurrencyUnit;
-        private string DiscordChannelName; // Added missing configuration variable
-        private ulong CurrencySkinID;
-
-        // Transaction timing settings (moved to config)
-        private int CheckIntervalSeconds;
-        private int InvoiceTimeoutSeconds;
-        private int RetryDelaySeconds;
-        private int MaxRetries;
-
-        // Blacklisted domains
-        private List<string> BlacklistedDomains = new List<string>();
-
-        // File names
-        private const string SellLogFile = "Orangemart/sell_log.json";
-        private const string BuyInvoiceLogFile = "Orangemart/buy_invoices.json";
-
-        // LNDHub configuration
-        private LNDHubConfig config;
-        private string authToken;
-
-        private List<PendingInvoice> pendingInvoices = new List<PendingInvoice>();
-        private Dictionary<string, int> retryCounts = new Dictionary<string, int>();
-
-        // Added for handling 404-specific retries
-        private Dictionary<string, int> retryCounts404 = new Dictionary<string, int>();
-        private const int Max404Retries = 5;
-        private const int RetryDelaySeconds404 = 5;
-
-        private class LNDHubConfig
+        // Configuration sections and keys
+        private static class ConfigSections
         {
-            public string Username { get; set; }
-            public string Password { get; set; }
+            public const string Commands = "Commands";
+            public const string CurrencySettings = "CurrencySettings";
+            public const string Discord = "Discord";
+            public const string InvoiceSettings = "InvoiceSettings";
+            public const string VIPSettings = "VIPSettings";
+        }
+
+        private static class ConfigKeys
+        {
+            // Commands
+            public const string BuyCurrencyCommandName = "BuyCurrencyCommandName";
+            public const string SendCurrencyCommandName = "SendCurrencyCommandName";
+            public const string BuyVipCommandName = "BuyVipCommandName";
+
+            // CurrencySettings
+            public const string CurrencyItemID = "CurrencyItemID";
+            public const string CurrencyName = "CurrencyName";
+            public const string CurrencySkinID = "CurrencySkinID";
+            public const string PricePerCurrencyUnit = "PricePerCurrencyUnit";
+            public const string SatsPerCurrencyUnit = "SatsPerCurrencyUnit";
+
+            // Discord
+            public const string DiscordChannelName = "DiscordChannelName";
+            public const string DiscordWebhookUrl = "DiscordWebhookUrl";
+
+            // InvoiceSettings
+            public const string BlacklistedDomains = "BlacklistedDomains";
+            public const string WhitelistedDomains = "WhitelistedDomains";
+            public const string CheckIntervalSeconds = "CheckIntervalSeconds";
+            public const string InvoiceTimeoutSeconds = "InvoiceTimeoutSeconds";
+            public const string LNbitsApiKey = "LNbitsApiKey";
+            public const string LNbitsBaseUrl = "LNbitsBaseUrl";
+            public const string MaxRetries = "MaxRetries";
+
+            // VIPSettings
+            public const string VipPermissionGroup = "VipPermissionGroup";
+            public const string VipPrice = "VipPrice";
+        }
+
+        // Configuration variables
+        private int currencyItemID;
+        private string buyCurrencyCommandName;
+        private string sendCurrencyCommandName;
+        private string buyVipCommandName;
+        private int vipPrice;
+        private string vipPermissionGroup;
+        private string currencyName;
+        private int satsPerCurrencyUnit;
+        private int pricePerCurrencyUnit;
+        private string discordChannelName;
+        private ulong currencySkinID;
+        private int checkIntervalSeconds;
+        private int invoiceTimeoutSeconds;
+        private int maxRetries;
+        private List<string> blacklistedDomains = new List<string>();
+        private List<string> whitelistedDomains = new List<string>();
+        private const string SellLogFile = "Orangemart/send_bitcoin.json";
+        private const string BuyInvoiceLogFile = "Orangemart/buy_invoices.json";
+        private LNbitsConfig config;
+        private List<PendingInvoice> pendingInvoices = new List<PendingInvoice>();
+        private Dictionary<string, int> retryCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        // LNbits Configuration
+        private class LNbitsConfig
+        {
             public string BaseUrl { get; set; }
+            public string ApiKey { get; set; }
             public string DiscordWebhookUrl { get; set; }
 
-            public static LNDHubConfig ParseLNDHubConnection(string connectionString)
+            public static LNbitsConfig ParseLNbitsConnection(string baseUrl, string apiKey, string discordWebhookUrl)
             {
-                try
+                var trimmedBaseUrl = baseUrl.TrimEnd('/');
+                if (!Uri.IsWellFormedUriString(trimmedBaseUrl, UriKind.Absolute))
+                    throw new Exception("Invalid base URL in connection string.");
+
+                return new LNbitsConfig
                 {
-                    var withoutScheme = connectionString.Replace("lndhub://", "");
-                    var parts = withoutScheme.Split('@');
-                    if (parts.Length != 2)
-                        throw new Exception("Invalid connection string format.");
-
-                    var userInfoPart = parts[0];
-                    var baseUrlPart = parts[1];
-
-                    var userInfo = userInfoPart.Split(':');
-                    if (userInfo.Length != 2)
-                        throw new Exception("Invalid user info in connection string.");
-
-                    var username = userInfo[0];
-                    var password = userInfo[1];
-
-                    var baseUrl = baseUrlPart.TrimEnd('/');
-                    if (!Uri.IsWellFormedUriString(baseUrl, UriKind.Absolute))
-                        throw new Exception("Invalid base URL in connection string.");
-
-                    return new LNDHubConfig
-                    {
-                        Username = username,
-                        Password = password,
-                        BaseUrl = baseUrl
-                    };
-                }
-                catch (Exception ex)
-                {
-                    throw new Exception($"Error parsing LNDHub connection string: {ex.Message}");
-                }
+                    BaseUrl = trimmedBaseUrl,
+                    ApiKey = apiKey,
+                    DiscordWebhookUrl = discordWebhookUrl
+                };
             }
         }
 
-        private class AuthResponse
-        {
-            [JsonProperty("access_token")]
-            public string AccessToken { get; set; }
-
-            [JsonProperty("refresh_token")]
-            public string RefreshToken { get; set; }
-        }
-
+        // Invoice and Payment Classes
         private class InvoiceResponse
         {
             [JsonProperty("payment_request")]
             public string PaymentRequest { get; set; }
 
-            [JsonProperty("r_hash")]
-            public RHashData RHash { get; set; }
-
-            public class RHashData
-            {
-                [JsonProperty("data")]
-                public byte[] Data { get; set; }
-            }
+            [JsonProperty("payment_hash")]
+            public string PaymentHash { get; set; }
         }
 
         private class SellInvoiceLogEntry
@@ -125,13 +115,11 @@ namespace Oxide.Plugins
             public string SteamID { get; set; }
             public string LightningAddress { get; set; }
             public bool Success { get; set; }
-            public int SatsAmount { get; set; } // Log the amount of sats sent
-            public int Fee { get; set; } // Log the fee
-            public int FeeMsat { get; set; } // Log the fee in millisatoshis
-            public string PaymentRequest { get; set; } // Log the BOLT11 payment request
-            public string PaymentHash { get; set; } // Log the payment hash
-            public bool CurrencyReturned { get; set; } // Indicates if currency was returned
+            public int SatsAmount { get; set; }
+            public string PaymentHash { get; set; }
+            public bool CurrencyReturned { get; set; }
             public DateTime Timestamp { get; set; }
+            public int RetryCount { get; set; }
         }
 
         private class BuyInvoiceLogEntry
@@ -141,8 +129,9 @@ namespace Oxide.Plugins
             public bool IsPaid { get; set; }
             public DateTime Timestamp { get; set; }
             public int Amount { get; set; }
-            public bool CurrencyGiven { get; set; } // For currency purchases
-            public bool VipGranted { get; set; } // For VIP purchases
+            public bool CurrencyGiven { get; set; }
+            public bool VipGranted { get; set; }
+            public int RetryCount { get; set; }
         }
 
         private class PendingInvoice
@@ -158,7 +147,17 @@ namespace Oxide.Plugins
         private enum PurchaseType
         {
             Currency,
-            Vip
+            Vip,
+            SendBitcoin
+        }
+
+        private class PaymentStatusResponse
+        {
+            [JsonProperty("paid")]
+            public bool Paid { get; set; }
+
+            [JsonProperty("preimage")]
+            public string Preimage { get; set; }
         }
 
         protected override void LoadConfig()
@@ -166,54 +165,51 @@ namespace Oxide.Plugins
             base.LoadConfig();
             try
             {
-                // Check if config is loaded properly
-                if (Config == null || !Config.Exists())
+                bool configChanged = false;
+
+                // Parse LNbits connection settings
+                config = LNbitsConfig.ParseLNbitsConnection(
+                    GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.LNbitsBaseUrl, "https://your-lnbits-instance.com", ref configChanged),
+                    GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.LNbitsApiKey, "your-lnbits-admin-api-key", ref configChanged),
+                    GetConfigValue(ConfigSections.Discord, ConfigKeys.DiscordWebhookUrl, "https://discord.com/api/webhooks/your_webhook_url", ref configChanged)
+                );
+
+                // Parse Currency Settings
+                currencyItemID = GetConfigValue(ConfigSections.CurrencySettings, ConfigKeys.CurrencyItemID, 1776460938, ref configChanged);
+                currencyName = GetConfigValue(ConfigSections.CurrencySettings, ConfigKeys.CurrencyName, "blood", ref configChanged);
+                satsPerCurrencyUnit = GetConfigValue(ConfigSections.CurrencySettings, ConfigKeys.SatsPerCurrencyUnit, 1, ref configChanged);
+                pricePerCurrencyUnit = GetConfigValue(ConfigSections.CurrencySettings, ConfigKeys.PricePerCurrencyUnit, 1, ref configChanged);
+                currencySkinID = GetConfigValue(ConfigSections.CurrencySettings, ConfigKeys.CurrencySkinID, 0UL, ref configChanged);
+
+                // Parse Command Names
+                buyCurrencyCommandName = GetConfigValue(ConfigSections.Commands, ConfigKeys.BuyCurrencyCommandName, "buyblood", ref configChanged);
+                sendCurrencyCommandName = GetConfigValue(ConfigSections.Commands, ConfigKeys.SendCurrencyCommandName, "sendblood", ref configChanged);
+                buyVipCommandName = GetConfigValue(ConfigSections.Commands, ConfigKeys.BuyVipCommandName, "buyvip", ref configChanged);
+
+                // Parse VIP Settings
+                vipPrice = GetConfigValue(ConfigSections.VIPSettings, ConfigKeys.VipPrice, 1000, ref configChanged);
+                vipPermissionGroup = GetConfigValue(ConfigSections.VIPSettings, ConfigKeys.VipPermissionGroup, "vip", ref configChanged);
+
+                // Parse Discord Settings
+                discordChannelName = GetConfigValue(ConfigSections.Discord, ConfigKeys.DiscordChannelName, "mart", ref configChanged);
+
+                // Parse Invoice Settings
+                checkIntervalSeconds = GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.CheckIntervalSeconds, 10, ref configChanged);
+                invoiceTimeoutSeconds = GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.InvoiceTimeoutSeconds, 300, ref configChanged);
+                maxRetries = GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.MaxRetries, 25, ref configChanged);
+
+                blacklistedDomains = GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.BlacklistedDomains, new List<string> { "example.com", "blacklisted.net" }, ref configChanged)
+                    .Select(d => d.ToLower()).ToList();
+
+                whitelistedDomains = GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.WhitelistedDomains, new List<string>(), ref configChanged)
+                    .Select(d => d.ToLower()).ToList();
+
+                MigrateConfig();
+
+                if (configChanged)
                 {
-                    PrintError("Configuration file is missing or empty. Creating default configuration.");
-                    LoadDefaultConfig();
                     SaveConfig();
                 }
-
-                // Access LNDHubConnection from the InvoiceSettings section
-                string lndhubConnectionString = (Config["InvoiceSettings"] as Dictionary<string, object>)?["LNDHubConnection"]?.ToString();
-                string discordWebhookUrl = (Config["Discord"] as Dictionary<string, object>)?["DiscordWebhookUrl"]?.ToString();
-
-                if (string.IsNullOrEmpty(lndhubConnectionString))
-                {
-                    PrintError("LNDHubConnection is not set in the configuration file.");
-                    return;
-                }
-
-                config = LNDHubConfig.ParseLNDHubConnection(lndhubConnectionString);
-                config.DiscordWebhookUrl = discordWebhookUrl;
-
-                // Load other configuration settings...
-                var currencySettings = Config["CurrencySettings"] as Dictionary<string, object>;
-                CurrencyItemID = Convert.ToInt32(currencySettings?["CurrencyItemID"] ?? 1776460938);
-                CurrencyName = currencySettings?["CurrencyName"]?.ToString() ?? "blood";
-                SatsPerCurrencyUnit = Convert.ToInt32(currencySettings?["SatsPerCurrencyUnit"] ?? 1);
-                PricePerCurrencyUnit = Convert.ToInt32(currencySettings?["PricePerCurrencyUnit"] ?? 1);
-                CurrencySkinID = (ulong)Convert.ToInt64(currencySettings?["CurrencySkinID"] ?? 0);
-
-                var commandsSettings = Config["Commands"] as Dictionary<string, object>;
-                BuyCurrencyCommandName = commandsSettings?["BuyCurrencyCommandName"]?.ToString() ?? "buyblood";
-                SendCurrencyCommandName = commandsSettings?["SendCurrencyCommandName"]?.ToString() ?? "sendblood";
-                BuyVipCommandName = commandsSettings?["BuyVipCommandName"]?.ToString() ?? "buyvip";
-
-                var vipSettings = Config["VIPSettings"] as Dictionary<string, object>;
-                VipPrice = Convert.ToInt32(vipSettings?["VipPrice"] ?? 1000);
-                VipPermissionGroup = vipSettings?["VipPermissionGroup"]?.ToString() ?? "vip";
-
-                // Load DiscordChannelName from Discord section
-                DiscordChannelName = (Config["Discord"] as Dictionary<string, object>)?["DiscordChannelName"]?.ToString() ?? "mart";
-
-                // Load invoice settings
-                var invoiceSettings = Config["InvoiceSettings"] as Dictionary<string, object>;
-                CheckIntervalSeconds = Convert.ToInt32(invoiceSettings?["CheckIntervalSeconds"] ?? 10);
-                InvoiceTimeoutSeconds = Convert.ToInt32(invoiceSettings?["InvoiceTimeoutSeconds"] ?? 300);
-                RetryDelaySeconds = Convert.ToInt32(invoiceSettings?["RetryDelaySeconds"] ?? 10);
-                MaxRetries = Convert.ToInt32(invoiceSettings?["MaxRetries"] ?? 25);
-                BlacklistedDomains = (invoiceSettings?["BlacklistedDomains"] as List<object>)?.ConvertAll(d => d.ToString().ToLower()) ?? new List<string>();
             }
             catch (Exception ex)
             {
@@ -221,46 +217,139 @@ namespace Oxide.Plugins
             }
         }
 
+        private void MigrateConfig()
+        {
+            bool configChanged = false;
+
+            if (!(Config[ConfigSections.InvoiceSettings] is Dictionary<string, object> invoiceSettings))
+            {
+                invoiceSettings = new Dictionary<string, object>();
+                Config[ConfigSections.InvoiceSettings] = invoiceSettings;
+                configChanged = true;
+            }
+
+            if (!invoiceSettings.ContainsKey(ConfigKeys.WhitelistedDomains))
+            {
+                invoiceSettings[ConfigKeys.WhitelistedDomains] = new List<string>();
+                configChanged = true;
+            }
+
+            if (configChanged)
+            {
+                SaveConfig();
+            }
+        }
+
+        private T GetConfigValue<T>(string section, string key, T defaultValue, ref bool configChanged)
+        {
+            if (!(Config[section] is Dictionary<string, object> data))
+            {
+                data = new Dictionary<string, object>();
+                Config[section] = data;
+                configChanged = true;
+            }
+
+            if (!data.TryGetValue(key, out var value))
+            {
+                value = defaultValue;
+                data[key] = value;
+                configChanged = true;
+            }
+
+            try
+            {
+                if (value is T tValue)
+                {
+                    return tValue;
+                }
+                else if (typeof(T) == typeof(List<string>))
+                {
+                    if (value is IEnumerable<object> enumerable)
+                    {
+                        return (T)(object)enumerable.Select(item => item.ToString()).ToList();
+                    }
+                    else if (value is string singleString)
+                    {
+                        return (T)(object)new List<string> { singleString };
+                    }
+                    else
+                    {
+                        PrintError($"Unexpected type for [{section}][{key}]. Using default value.");
+                        data[key] = defaultValue;
+                        configChanged = true;
+                        return defaultValue;
+                    }
+                }
+                else if (typeof(T) == typeof(ulong))
+                {
+                    if (value is long longVal)
+                    {
+                        return (T)(object)(ulong)longVal;
+                    }
+                    else if (value is ulong ulongVal)
+                    {
+                        return (T)(object)ulongVal;
+                    }
+                    else
+                    {
+                        return (T)Convert.ChangeType(value, typeof(T));
+                    }
+                }
+                else
+                {
+                    return (T)Convert.ChangeType(value, typeof(T));
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintError($"Error converting config value for [{section}][{key}]: {ex.Message}. Using default value.");
+                data[key] = defaultValue;
+                configChanged = true;
+                return defaultValue;
+            }
+        }
+
         protected override void LoadDefaultConfig()
         {
-            Config["Commands"] = new Dictionary<string, object>
+            Config[ConfigSections.Commands] = new Dictionary<string, object>
             {
-                ["BuyCurrencyCommandName"] = "buyblood",
-                ["BuyVipCommandName"] = "buyvip",
-                ["SendCurrencyCommandName"] = "sendblood"
+                [ConfigKeys.BuyCurrencyCommandName] = "buyblood",
+                [ConfigKeys.BuyVipCommandName] = "buyvip",
+                [ConfigKeys.SendCurrencyCommandName] = "sendblood"
             };
 
-            Config["Discord"] = new Dictionary<string, object>
+            Config[ConfigSections.CurrencySettings] = new Dictionary<string, object>
             {
-                ["DiscordChannelName"] = "mart",
-                ["DiscordWebhookUrl"] = "https://discord.com/api/webhooks/your_webhook_url"
+                [ConfigKeys.CurrencyItemID] = 1776460938,
+                [ConfigKeys.CurrencyName] = "blood",
+                [ConfigKeys.CurrencySkinID] = 0UL,
+                [ConfigKeys.PricePerCurrencyUnit] = 1,
+                [ConfigKeys.SatsPerCurrencyUnit] = 1
             };
 
-            Config["InvoiceSettings"] = new Dictionary<string, object>
+            Config[ConfigSections.Discord] = new Dictionary<string, object>
             {
-                ["BlacklistedDomains"] = new List<string> { "example.com", "blacklisted.net" },
-                ["CheckIntervalSeconds"] = 10,
-                ["InvoiceTimeoutSeconds"] = 300,
-                ["LNDHubConnection"] = "lndhub://admin:password@sats.love/",
-                ["MaxRetries"] = 25,
-                ["RetryDelaySeconds"] = 10
+                [ConfigKeys.DiscordChannelName] = "mart",
+                [ConfigKeys.DiscordWebhookUrl] = "https://discord.com/api/webhooks/your_webhook_url"
             };
 
-            Config["VIPSettings"] = new Dictionary<string, object>
+            Config[ConfigSections.InvoiceSettings] = new Dictionary<string, object>
             {
-                ["VipPermissionGroup"] = "vip",
-                ["VipPrice"] = 1000
+                [ConfigKeys.BlacklistedDomains] = new List<string> { "example.com", "blacklisted.net" },
+                [ConfigKeys.WhitelistedDomains] = new List<string>(),
+                [ConfigKeys.CheckIntervalSeconds] = 10,
+                [ConfigKeys.InvoiceTimeoutSeconds] = 300,
+                [ConfigKeys.LNbitsApiKey] = "your-lnbits-admin-api-key",
+                [ConfigKeys.LNbitsBaseUrl] = "https://your-lnbits-instance.com",
+                [ConfigKeys.MaxRetries] = 25
             };
 
-            Config["CurrencySettings"] = new Dictionary<string, object>
+            Config[ConfigSections.VIPSettings] = new Dictionary<string, object>
             {
-                ["CurrencyItemID"] = 1776460938,
-                ["CurrencyName"] = "blood",
-                ["PricePerCurrencyUnit"] = 1,
-                ["SatsPerCurrencyUnit"] = 1,
-                ["CurrencySkinID"] = 0
+                [ConfigKeys.VipPermissionGroup] = "vip",
+                [ConfigKeys.VipPrice] = 1000
             };
-        }        
+        }
 
         private void Init()
         {
@@ -278,20 +367,19 @@ namespace Oxide.Plugins
                 return;
             }
 
-            // Register commands dynamically
-            AddCovalenceCommand(BuyCurrencyCommandName, nameof(CmdBuyCurrency), "orangemart.buycurrency");
-            AddCovalenceCommand(SendCurrencyCommandName, nameof(CmdSendCurrency), "orangemart.sendcurrency");
-            AddCovalenceCommand(BuyVipCommandName, nameof(CmdBuyVip), "orangemart.buyvip");
+            // Register commands
+            AddCovalenceCommand(buyCurrencyCommandName, nameof(CmdBuyCurrency), "orangemart.buycurrency");
+            AddCovalenceCommand(sendCurrencyCommandName, nameof(CmdSendCurrency), "orangemart.sendcurrency");
+            AddCovalenceCommand(buyVipCommandName, nameof(CmdBuyVip), "orangemart.buyvip");
 
-            timer.Every(CheckIntervalSeconds, CheckPendingInvoices);
+            // Start a timer to check pending invoices periodically
+            timer.Every(checkIntervalSeconds, CheckPendingInvoices);
         }
 
         private void Unload()
         {
             pendingInvoices.Clear();
             retryCounts.Clear();
-            retryCounts404.Clear(); // Clear 404-specific retries
-            authToken = null;
         }
 
         protected override void LoadDefaultMessages()
@@ -302,10 +390,10 @@ namespace Oxide.Plugins
                 ["NeedMoreCurrency"] = "You need more {0}. You currently have {1}.",
                 ["FailedToReserveCurrency"] = "Failed to reserve currency. Please try again.",
                 ["FailedToQueryLightningAddress"] = "Failed to query Lightning address for an invoice.",
-                ["FailedToAuthenticate"] = "Failed to authenticate with LNDHub.",
+                ["FailedToAuthenticate"] = "Failed to authenticate with LNbits.",
                 ["InvoiceCreatedCheckDiscord"] = "Invoice created! Please check the #{0} channel on Discord to complete your payment.",
                 ["FailedToCreateInvoice"] = "Failed to create an invoice. Please try again later.",
-                ["FailedToProcessPayment"] = "Failed to process payment.",
+                ["FailedToProcessPayment"] = "Failed to process payment. Please try again later.",
                 ["CurrencySentSuccess"] = "You have successfully sent {0} {1}!",
                 ["PurchaseSuccess"] = "You have successfully purchased {0} {1}!",
                 ["PurchaseVipSuccess"] = "You have successfully purchased VIP status!",
@@ -315,7 +403,10 @@ namespace Oxide.Plugins
                 ["FailedToCreateCurrencyItem"] = "Failed to create {0} item for player {1}.",
                 ["AddedToVipGroup"] = "Player {0} added to VIP group '{1}'.",
                 ["InvoiceExpired"] = "Your invoice for {0} sats has expired. Please try again.",
-                ["BlacklistedDomain"] = "The domain '{0}' is currently blacklisted. Please use a different Lightning address."
+                ["BlacklistedDomain"] = "The domain '{0}' is currently blacklisted. Please use a different Lightning address.",
+                ["NotWhitelistedDomain"] = "The domain '{0}' is not whitelisted. Please use a Lightning address from the following domains: {1}.",
+                ["InvalidLightningAddress"] = "The Lightning Address provided is invalid or cannot be resolved.",
+                ["PaymentProcessing"] = "Your payment is being processed. You will receive a confirmation once it's complete."
             }, this);
         }
 
@@ -324,275 +415,184 @@ namespace Oxide.Plugins
             return string.Format(lang.GetMessage(key, this, userId), args);
         }
 
+        private List<Item> GetAllInventoryItems(BasePlayer player)
+        {
+            List<Item> allItems = new List<Item>();
+
+            // Main Inventory
+            if (player.inventory.containerMain != null)
+                allItems.AddRange(player.inventory.containerMain.itemList);
+
+            // Belt (Hotbar)
+            if (player.inventory.containerBelt != null)
+                allItems.AddRange(player.inventory.containerBelt.itemList);
+
+            // Wear (Clothing)
+            if (player.inventory.containerWear != null)
+                allItems.AddRange(player.inventory.containerWear.itemList);
+
+            return allItems;
+        }
+
         private void CheckPendingInvoices()
         {
-            foreach (var invoice in pendingInvoices.ToArray())
+            foreach (var invoice in pendingInvoices.ToList())
             {
-                CheckInvoicePaid(invoice.RHash, (isPaid, isPending) =>
+                string localPaymentHash = invoice.RHash.ToLower();
+                CheckInvoicePaid(localPaymentHash, isPaid =>
                 {
                     if (isPaid)
                     {
                         pendingInvoices.Remove(invoice);
 
-                        if (invoice.Type == PurchaseType.Currency)
+                        switch (invoice.Type)
                         {
-                            RewardPlayer(invoice.Player, invoice.Amount);
-                        }
-                        else if (invoice.Type == PurchaseType.Vip)
-                        {
-                            GrantVip(invoice.Player);
-                        }
-
-                        var logEntry = new BuyInvoiceLogEntry
-                        {
-                            SteamID = invoice.Player.Id,
-                            InvoiceID = invoice.RHash,
-                            IsPaid = true,
-                            Timestamp = DateTime.UtcNow,
-                            Amount = invoice.Amount,
-                            CurrencyGiven = invoice.Type == PurchaseType.Currency,
-                            VipGranted = invoice.Type == PurchaseType.Vip
-                        };
-                        LogBuyInvoice(logEntry);
-                    }
-                    else if (!isPending)
-                    {
-                        if (!retryCounts.ContainsKey(invoice.RHash))
-                        {
-                            retryCounts[invoice.RHash] = 0;
+                            case PurchaseType.Currency:
+                                RewardPlayer(invoice.Player, invoice.Amount);
+                                break;
+                            case PurchaseType.Vip:
+                                GrantVip(invoice.Player);
+                                break;
+                            case PurchaseType.SendBitcoin:
+                                invoice.Player.Reply(Lang("CurrencySentSuccess", invoice.Player.Id, invoice.Amount, currencyName));
+                                break;
                         }
 
-                        retryCounts[invoice.RHash]++;
-                        if (retryCounts[invoice.RHash] >= MaxRetries)
+                        if (invoice.Type == PurchaseType.SendBitcoin)
                         {
-                            pendingInvoices.Remove(invoice);
-                            retryCounts.Remove(invoice.RHash);
-                            PrintWarning($"Invoice for player {invoice.Player.Id} expired (amount: {invoice.Amount} sats).");
-
-                            // Notify the player about the expired invoice
-                            invoice.Player.Reply(Lang("InvoiceExpired", invoice.Player.Id, invoice.Amount));
-
-                            var logEntry = new BuyInvoiceLogEntry
+                            var logEntry = new SellInvoiceLogEntry
                             {
-                                SteamID = invoice.Player.Id,
-                                InvoiceID = invoice.RHash,
-                                IsPaid = false,
+                                SteamID = GetPlayerId(invoice.Player),
+                                LightningAddress = ExtractLightningAddress(invoice.Memo),
+                                Success = true,
+                                SatsAmount = invoice.Amount,
+                                PaymentHash = invoice.RHash,
+                                CurrencyReturned = false,
                                 Timestamp = DateTime.UtcNow,
-                                Amount = invoice.Amount,
-                                CurrencyGiven = false,
-                                VipGranted = false
+                                RetryCount = retryCounts.ContainsKey(invoice.RHash) ? retryCounts[invoice.RHash] : 0
                             };
-                            LogBuyInvoice(logEntry);
+                            LogSellTransaction(logEntry);
+
+                            Puts($"Invoice {invoice.RHash} marked as paid. RetryCount: {logEntry.RetryCount}");
                         }
                         else
                         {
-                            PrintWarning($"Retrying invoice {invoice.RHash}. Attempt {retryCounts[invoice.RHash]} of {MaxRetries}.");
+                            var logEntry = CreateBuyInvoiceLogEntry(
+                                player: invoice.Player,
+                                invoiceID: invoice.RHash,
+                                isPaid: true,
+                                amount: invoice.Type == PurchaseType.SendBitcoin ? invoice.Amount : invoice.Amount * pricePerCurrencyUnit,
+                                type: invoice.Type,
+                                retryCount: retryCounts.ContainsKey(invoice.RHash) ? retryCounts[invoice.RHash] : 0
+                            );
+                            LogBuyInvoice(logEntry);
+                            Puts($"Invoice {invoice.RHash} marked as paid. RetryCount: {logEntry.RetryCount}");
+                        }
+
+                        retryCounts.Remove(invoice.RHash);
+                    }
+                    else
+                    {
+                        if (!retryCounts.ContainsKey(localPaymentHash))
+                        {
+                            retryCounts[localPaymentHash] = 0;
+                            Puts($"Initialized retry count for paymentHash: {localPaymentHash}");
+                        }
+
+                        retryCounts[localPaymentHash]++;
+                        Puts($"Retry count for paymentHash {localPaymentHash}: {retryCounts[localPaymentHash]} of {maxRetries}");
+
+                        if (retryCounts[localPaymentHash] >= maxRetries)
+                        {
+                            pendingInvoices.Remove(invoice);
+                            int finalRetryCount = retryCounts[localPaymentHash];
+                            retryCounts.Remove(localPaymentHash);
+                            PrintWarning($"Invoice for player {GetPlayerId(invoice.Player)} expired (amount: {invoice.Amount} sats).");
+
+                            invoice.Player.Reply(Lang("InvoiceExpired", invoice.Player.Id, invoice.Amount));
+
+                            if (invoice.Type == PurchaseType.SendBitcoin)
+                            {
+                                var basePlayer = invoice.Player.Object as BasePlayer;
+                                if (basePlayer != null)
+                                {
+                                    ReturnCurrency(basePlayer, invoice.Amount / satsPerCurrencyUnit);
+                                    Puts($"Refunded {invoice.Amount / satsPerCurrencyUnit} {currencyName} to player {basePlayer.UserIDString} due to failed payment.");
+                                }
+                                else
+                                {
+                                    PrintError($"Failed to find base player object for player {invoice.Player.Id} to refund currency.");
+                                }
+
+                                var failedLogEntry = new SellInvoiceLogEntry
+                                {
+                                    SteamID = GetPlayerId(invoice.Player),
+                                    LightningAddress = ExtractLightningAddress(invoice.Memo),
+                                    Success = false,
+                                    SatsAmount = invoice.Amount,
+                                    PaymentHash = invoice.RHash,
+                                    CurrencyReturned = true,
+                                    Timestamp = DateTime.UtcNow,
+                                    RetryCount = finalRetryCount
+                                };
+                                LogSellTransaction(failedLogEntry);
+                                Puts($"Invoice {localPaymentHash} expired after {finalRetryCount} retries.");
+                            }
+                            else
+                            {
+                                var failedLogEntry = CreateBuyInvoiceLogEntry(
+                                    player: invoice.Player,
+                                    invoiceID: localPaymentHash,
+                                    isPaid: false,
+                                    amount: invoice.Type == PurchaseType.SendBitcoin ? invoice.Amount : invoice.Amount * pricePerCurrencyUnit,
+                                    type: invoice.Type,
+                                    retryCount: finalRetryCount
+                                );
+                                LogBuyInvoice(failedLogEntry);
+                                Puts($"Invoice {localPaymentHash} expired after {finalRetryCount} retries.");
+                            }
+                        }
+                        else
+                        {
+                            PrintWarning($"Retrying invoice {localPaymentHash}. Attempt {retryCounts[localPaymentHash]} of {maxRetries}.");
                         }
                     }
                 });
             }
         }
 
-        private void CheckInvoicePaid(string rHash, Action<bool, bool> callback)
+        private void CheckInvoicePaid(string paymentHash, Action<bool> callback)
         {
-            if (string.IsNullOrEmpty(authToken))
-            {
-                GetAuthToken(token =>
-                {
-                    if (!string.IsNullOrEmpty(token))
-                    {
-                        CheckInvoicePaid(rHash, callback); // Retry after getting token
-                    }
-                    else
-                    {
-                        callback(false, false);
-                    }
-                });
-                return;
-            }
-
-            string baseUrlForCheckingInvoice = config.BaseUrl.Replace("/lndhub/ext", ""); // Remove any "/lndhub/ext" part
-            string url = $"{baseUrlForCheckingInvoice}/api/v1/payments/{rHash}";
-
-            PrintWarning($"Checking invoice at URL: {url}");
-            PrintWarning($"rHash being checked: {rHash}");
+            string normalizedPaymentHash = paymentHash.ToLower();
+            string url = $"{config.BaseUrl}/api/v1/payments/{normalizedPaymentHash}";
 
             var headers = new Dictionary<string, string>
             {
-                { "X-Api-Key", authToken },
-                { "Content-Type", "application/json" }
+                { "Content-Type", "application/json" },
+                { "X-Api-Key", config.ApiKey }
             };
 
-            webrequest.Enqueue(url, null, (code, response) =>
+            MakeWebRequest(url, null, (code, response) =>
             {
-                if (code == 404)
-                {
-                    PrintError($"Error checking invoice status: HTTP {code} (Not Found)");
-                    PrintWarning($"Ensure the correct rHash: {rHash}");
-
-                    // Initialize retry count for 404 if not present
-                    if (!retryCounts404.ContainsKey(rHash))
-                    {
-                        retryCounts404[rHash] = 1;
-                    }
-                    else
-                    {
-                        retryCounts404[rHash]++;
-                    }
-
-                    // Check if retry count has exceeded the maximum allowed retries (5)
-                    if (retryCounts404[rHash] <= Max404Retries)
-                    {
-                        PrintWarning($"Retrying invoice {rHash}. Attempt {retryCounts404[rHash]} of {Max404Retries}.");
-
-                        // Schedule a retry after 5 seconds
-                        timer.Once(RetryDelaySeconds404, () =>
-                        {
-                            CheckInvoicePaid(rHash, callback);
-                        });
-                    }
-                    else
-                    {
-                        PrintWarning($"Max retries reached for invoice {rHash}. Marking as failed.");
-
-                        // Remove the retry count as we've exceeded the max retries
-                        retryCounts404.Remove(rHash);
-
-                        // Optionally, notify the player about the failed payment
-                        var invoice = pendingInvoices.Find(inv => inv.RHash == rHash);
-                        if (invoice != null)
-                        {
-                            pendingInvoices.Remove(invoice);
-                            invoice.Player.Reply(Lang("InvoiceExpired", invoice.Player.Id, invoice.Amount));
-
-                            var logEntry = new BuyInvoiceLogEntry
-                            {
-                                SteamID = invoice.Player.Id,
-                                InvoiceID = invoice.RHash,
-                                IsPaid = false,
-                                Timestamp = DateTime.UtcNow,
-                                Amount = invoice.Amount,
-                                CurrencyGiven = invoice.Type == PurchaseType.Currency,
-                                VipGranted = invoice.Type == PurchaseType.Vip
-                            };
-                            LogBuyInvoice(logEntry);
-                        }
-
-                        // Finally, mark the payment as failed
-                        callback(false, false);
-                    }
-                    return;
-                }
-
                 if (code != 200 || string.IsNullOrEmpty(response))
                 {
                     PrintError($"Error checking invoice status: HTTP {code}");
-                    callback(false, false);
+                    callback(false);
                     return;
                 }
 
                 try
                 {
-                    var jsonResponse = JsonConvert.DeserializeObject<Dictionary<string, object>>(response);
-
-                    if (jsonResponse != null && jsonResponse.ContainsKey("paid"))
-                    {
-                        bool isPaid = Convert.ToBoolean(jsonResponse["paid"]);
-                        bool isPending = jsonResponse.ContainsKey("status") && jsonResponse["status"].ToString().ToLower() == "pending";
-
-                        if (isPaid)
-                        {
-                            // Remove retry counts (both general and 404-specific) on successful payment
-                            if (retryCounts.ContainsKey(rHash))
-                            {
-                                retryCounts.Remove(rHash);
-                            }
-
-                            if (retryCounts404.ContainsKey(rHash))
-                            {
-                                retryCounts404.Remove(rHash);
-                            }
-
-                            callback(true, false);
-                        }
-                        else if (isPending)
-                        {
-                            callback(false, true);
-                        }
-                        else
-                        {
-                            // For other statuses, you might want to handle them differently
-                            callback(false, false);
-                        }
-                    }
-                    else
-                    {
-                        callback(false, false);
-                    }
+                    var paymentStatus = JsonConvert.DeserializeObject<PaymentStatusResponse>(response);
+                    callback(paymentStatus != null && paymentStatus.Paid);
                 }
                 catch (Exception ex)
                 {
                     PrintError($"Failed to parse invoice status response: {ex.Message}");
-                    callback(false, false);
+                    callback(false);
                 }
-            }, this, RequestMethod.GET, headers);
+            }, RequestMethod.GET, headers);
         }
-
-        private void GetAuthToken(Action<string> callback)
-        {
-            if (!string.IsNullOrEmpty(authToken))
-            {
-                callback(authToken);
-                return;
-            }
-
-            string url = $"{config.BaseUrl}/auth";
-            Puts($"Attempting to authenticate with URL: {url}");
-
-            var requestBody = new
-            {
-                login = config.Username,
-                password = config.Password
-            };
-            string jsonBody = JsonConvert.SerializeObject(requestBody);
-
-            var headers = new Dictionary<string, string>
-            {
-                { "Content-Type", "application/json" }
-            };
-
-            webrequest.Enqueue(url, jsonBody, (code, response) =>
-            {
-                if (code != 200 || string.IsNullOrEmpty(response))
-                {
-                    PrintError($"Error getting auth token: HTTP {code}");
-                    PrintError($"Response: {response}");
-                    callback(null);
-                    return;
-                }
-
-                try
-                {
-                    var authResponse = JsonConvert.DeserializeObject<AuthResponse>(response);
-                    if (authResponse == null || string.IsNullOrEmpty(authResponse.AccessToken))
-                    {
-                        PrintError("Invalid auth response.");
-                        PrintError($"Response: {response}");
-                        callback(null);
-                        return;
-                    }
-
-                    authToken = authResponse.AccessToken;
-                    callback(authToken);
-                }
-                catch (Exception ex)
-                {
-                    PrintError($"Failed to parse auth response: {ex.Message}");
-                    PrintError($"Raw response: {response}");
-                    callback(null);
-                }
-            }, this, RequestMethod.POST, headers);
-        }        
 
         private void CmdSendCurrency(IPlayer player, string command, string[] args)
         {
@@ -604,149 +604,190 @@ namespace Oxide.Plugins
 
             if (args.Length != 2 || !int.TryParse(args[0], out int amount) || amount <= 0)
             {
-                player.Reply(Lang("UsageSendCurrency", player.Id, SendCurrencyCommandName));
+                player.Reply(Lang("UsageSendCurrency", player.Id, sendCurrencyCommandName));
                 return;
             }
 
             string lightningAddress = args[1];
 
-            // Check if the Lightning address is from a blacklisted domain
-            if (IsLightningAddressBlacklisted(lightningAddress))
+            if (!IsLightningAddressAllowed(lightningAddress))
             {
                 string domain = GetDomainFromLightningAddress(lightningAddress);
-                player.Reply(Lang("BlacklistedDomain", player.Id, domain));
+                if (whitelistedDomains.Any())
+                {
+                    string whitelist = string.Join(", ", whitelistedDomains);
+                    player.Reply(Lang("NotWhitelistedDomain", player.Id, domain, whitelist));
+                }
+                else
+                {
+                    player.Reply(Lang("BlacklistedDomain", player.Id, domain));
+                }
                 return;
             }
 
             var basePlayer = player.Object as BasePlayer;
             if (basePlayer == null)
             {
-                player.Reply(Lang("FailedToFindBasePlayer", player.Id, player.Name));
+                player.Reply(Lang("FailedToFindBasePlayer", player.Id));
                 return;
             }
 
-            int currencyAmount = 0;
-
-            // If CurrencySkinID is defined and greater than 0, only check for items with that skin ID
-            if (CurrencySkinID > 0)
-            {
-                var itemsWithSkin = basePlayer.inventory.FindItemsByItemID(CurrencyItemID);
-                foreach (var item in itemsWithSkin)
-                {
-                    if (item.skin == CurrencySkinID)
-                    {
-                        currencyAmount += item.amount;
-                    }
-                }
-
-                // If no matching items were found, inform the player and stop
-                if (currencyAmount == 0)
-                {
-                    player.Reply($"You do not have any {CurrencyName} with the required skin ID.");
-                    return;
-                }
-            }
-            else
-            {
-                // Check for all items with the given CurrencyItemID regardless of skin
-                currencyAmount = basePlayer.inventory.GetAmount(CurrencyItemID);
-            }
+            int currencyAmount = GetAllInventoryItems(basePlayer).Where(IsCurrencyItem).Sum(item => item.amount);
 
             if (currencyAmount < amount)
             {
-                player.Reply(Lang("NeedMoreCurrency", player.Id, CurrencyName, currencyAmount));
+                player.Reply(Lang("NeedMoreCurrency", player.Id, currencyName, currencyAmount));
                 return;
             }
 
-            // Reserve the currency by immediately removing it from the player's inventory
-            int reservedAmount = ReserveCurrencyWithSkin(basePlayer, amount);
-            if (reservedAmount == 0)
+            if (!TryReserveCurrency(basePlayer, amount))
             {
                 player.Reply(Lang("FailedToReserveCurrency", player.Id));
                 return;
             }
 
-            GetAuthToken(token =>
-            {
-                if (!string.IsNullOrEmpty(token))
-                {
-                    QueryLightningAddressForInvoice(lightningAddress, reservedAmount * SatsPerCurrencyUnit, invoiceUrl =>
-                    {
-                        if (string.IsNullOrEmpty(invoiceUrl))
-                        {
-                            // If the invoice query fails, return the currency
-                            ReturnCurrency(basePlayer, reservedAmount);
-                            player.Reply(Lang("FailedToQueryLightningAddress", player.Id));
-                            LogSellTransaction(player.Id, lightningAddress, false, reservedAmount * SatsPerCurrencyUnit, 0, 0, null, null, true);
-                            return;
-                        }
+            player.Reply(Lang("PaymentProcessing", player.Id));
 
-                        SendPayment(invoiceUrl, token, reservedAmount * SatsPerCurrencyUnit, player, lightningAddress, success =>
+            SendBitcoin(lightningAddress, amount * satsPerCurrencyUnit, (success, paymentHash) =>
+            {
+                if (success && !string.IsNullOrEmpty(paymentHash))
+                {
+                    LogSellTransaction(
+                        new SellInvoiceLogEntry
                         {
-                            if (success)
-                            {
-                                // Do nothing further as the currency is already removed on success
-                                player.Reply(Lang("CurrencySentSuccess", player.Id, reservedAmount, CurrencyName));
-                            }
-                            else
-                            {
-                                // If the payment fails, return the reserved currency
-                                ReturnCurrency(basePlayer, reservedAmount);
-                                player.Reply(Lang("FailedToProcessPayment", player.Id));
-                                LogSellTransaction(player.Id, lightningAddress, false, reservedAmount * SatsPerCurrencyUnit, 0, 0, null, null, true);
-                            }
-                        });
-                    });
+                            SteamID = GetPlayerId(player),
+                            LightningAddress = lightningAddress,
+                            Success = true,
+                            SatsAmount = amount * satsPerCurrencyUnit,
+                            PaymentHash = paymentHash,
+                            CurrencyReturned = false,
+                            Timestamp = DateTime.UtcNow,
+                            RetryCount = 0
+                        }
+                    );
+
+                    var pendingInvoice = new PendingInvoice
+                    {
+                        RHash = paymentHash.ToLower(),
+                        Player = player,
+                        Amount = amount * satsPerCurrencyUnit,
+                        Memo = $"Sending {amount} {currencyName} to {lightningAddress}",
+                        CreatedAt = DateTime.UtcNow,
+                        Type = PurchaseType.SendBitcoin
+                    };
+                    pendingInvoices.Add(pendingInvoice);
+
+                    Puts($"Outbound payment to {lightningAddress} initiated. PaymentHash: {paymentHash}");
                 }
                 else
                 {
-                    // If authentication fails, return the currency
-                    ReturnCurrency(basePlayer, reservedAmount);
-                    player.Reply(Lang("FailedToAuthenticate", player.Id));
-                    LogSellTransaction(player.Id, lightningAddress, false, reservedAmount * SatsPerCurrencyUnit, 0, 0, null, null, true);
+                    player.Reply(Lang("FailedToProcessPayment", player.Id));
+
+                    LogSellTransaction(
+                        new SellInvoiceLogEntry
+                        {
+                            SteamID = GetPlayerId(player),
+                            LightningAddress = lightningAddress,
+                            Success = false,
+                            SatsAmount = amount * satsPerCurrencyUnit,
+                            PaymentHash = null,
+                            CurrencyReturned = true,
+                            Timestamp = DateTime.UtcNow,
+                            RetryCount = 0
+                        }
+                    );
+
+                    Puts($"Outbound payment to {lightningAddress} failed to initiate.");
+
+                    ReturnCurrency(basePlayer, amount);
+                    Puts($"Returned {amount} {currencyName} to player {basePlayer.UserIDString} due to failed payment.");
                 }
             });
         }
 
-        // Helper method to reserve currency with the specific skin ID
-        private int ReserveCurrencyWithSkin(BasePlayer player, int amount)
+        private bool IsLightningAddressAllowed(string lightningAddress)
         {
-            var items = player.inventory.FindItemsByItemID(CurrencyItemID);
-            int remaining = amount;
-            int reserved = 0;
+            string domain = GetDomainFromLightningAddress(lightningAddress);
+            if (string.IsNullOrEmpty(domain))
+                return false;
 
-            foreach (var item in items)
+            if (whitelistedDomains.Any())
             {
-                // Check if the item matches the defined CurrencySkinID, if applicable
-                if (CurrencySkinID > 0 && item.skin != CurrencySkinID)
+                return whitelistedDomains.Contains(domain.ToLower());
+            }
+            else
+            {
+                return !blacklistedDomains.Contains(domain.ToLower());
+            }
+        }
+
+        private string GetDomainFromLightningAddress(string lightningAddress)
+        {
+            if (string.IsNullOrEmpty(lightningAddress))
+                return null;
+
+            var parts = lightningAddress.Split('@');
+            return parts.Length == 2 ? parts[1].ToLower() : null;
+        }
+
+        private void SendBitcoin(string lightningAddress, int satsAmount, Action<bool, string> callback)
+        {
+            ResolveLightningAddress(lightningAddress, satsAmount, bolt11 =>
+            {
+                if (string.IsNullOrEmpty(bolt11))
                 {
-                    continue; // Skip items without the defined skin ID
+                    PrintError($"Failed to resolve Lightning Address: {lightningAddress}");
+                    callback(false, null);
+                    return;
                 }
 
-                if (item.amount > remaining)
+                SendPayment(bolt11, satsAmount, (success, paymentHash) =>
                 {
-                    item.UseItem(remaining);
-                    reserved += remaining;
-                    remaining = 0;
-                    break;
-                }
-                else
-                {
-                    reserved += item.amount;
-                    remaining -= item.amount;
-                    item.Remove();
-                }
+                    if (success && !string.IsNullOrEmpty(paymentHash))
+                    {
+                        StartPaymentStatusCheck(paymentHash, isPaid =>
+                        {
+                            callback(isPaid, isPaid ? paymentHash : null);
+                        });
+                    }
+                    else
+                    {
+                        callback(false, null);
+                    }
+                });
+            });
+        }
+
+        private void StartPaymentStatusCheck(string paymentHash, Action<bool> callback)
+        {
+            if (!retryCounts.ContainsKey(paymentHash))
+            {
+                retryCounts[paymentHash] = 0;
             }
 
-            if (remaining > 0)
+            Timer timerInstance = null;
+            timerInstance = timer.Repeat(checkIntervalSeconds, maxRetries, () =>
             {
-                // Rollback if unable to remove the full amount
-                PrintWarning($"Could not reserve the full amount of {CurrencyName}. {remaining} remaining.");
-                ReturnCurrency(player, reserved); // Return whatever was taken
-                return 0; // Indicate failure to reserve
-            }
+                CheckInvoicePaid(paymentHash, isPaid =>
+                {
+                    if (isPaid)
+                    {
+                        callback(true);
+                        timerInstance.Destroy();
+                    }
+                    else
+                    {
+                        retryCounts[paymentHash]++;
+                        Puts($"PaymentHash {paymentHash} not yet paid. Retry {retryCounts[paymentHash]} of {maxRetries}.");
 
-            return reserved; // Return the amount actually reserved
+                        if (retryCounts[paymentHash] >= maxRetries)
+                        {
+                            callback(false);
+                            timerInstance.Destroy();
+                        }
+                    }
+                });
+            });
         }
 
         private void CmdBuyCurrency(IPlayer player, string command, string[] args)
@@ -759,60 +800,32 @@ namespace Oxide.Plugins
 
             if (args.Length != 1 || !int.TryParse(args[0], out int amount) || amount <= 0)
             {
-                player.Reply(Lang("InvalidCommandUsage", player.Id, BuyCurrencyCommandName));
+                player.Reply(Lang("InvalidCommandUsage", player.Id, buyCurrencyCommandName));
                 return;
             }
 
-            int amountSats = amount * PricePerCurrencyUnit;
+            int amountSats = amount * pricePerCurrencyUnit;
 
-            CreateInvoice(amountSats, $"Buying {amount} {CurrencyName}", invoiceResponse =>
+            CreateInvoice(amountSats, $"Buying {amount} {currencyName}", invoiceResponse =>
             {
                 if (invoiceResponse != null)
                 {
-                    // Send the invoice via Discord webhook
-                    SendInvoiceToDiscord(player, invoiceResponse.PaymentRequest, amountSats, $"Buying {amount} {CurrencyName}");
+                    SendInvoiceToDiscord(player, invoiceResponse.PaymentRequest, amountSats, $"Buying {amount} {currencyName}");
 
-                    // Notify the player in chat to check the Discord channel
-                    player.Reply(Lang("InvoiceCreatedCheckDiscord", player.Id, DiscordChannelName));
+                    player.Reply(Lang("InvoiceCreatedCheckDiscord", player.Id, discordChannelName));
 
-                    // Add the pending invoice
                     var pendingInvoice = new PendingInvoice
                     {
-                        RHash = BitConverter.ToString(invoiceResponse.RHash.Data).Replace("-", "").ToLower(),
+                        RHash = invoiceResponse.PaymentHash.ToLower(),
                         Player = player,
                         Amount = amount,
-                        Memo = $"Buying {amount} {CurrencyName}",
+                        Memo = $"Buying {amount} {currencyName}",
                         CreatedAt = DateTime.UtcNow,
                         Type = PurchaseType.Currency
                     };
                     pendingInvoices.Add(pendingInvoice);
 
-                    // Start checking the invoice status after a delay
-                    timer.Once(RetryDelaySeconds, () =>
-                    {
-                        CheckPendingInvoices();
-                    });
-
-                    // Expire invoice after timeout if unpaid
-                    timer.Once(InvoiceTimeoutSeconds, () =>
-                    {
-                        if (pendingInvoices.Contains(pendingInvoice))
-                        {
-                            pendingInvoices.Remove(pendingInvoice);
-                            PrintWarning($"Invoice for player {player.Id} expired (amount: {amountSats} sats).");
-
-                            var logEntry = new BuyInvoiceLogEntry
-                            {
-                                SteamID = player.Id,
-                                InvoiceID = pendingInvoice.RHash,
-                                IsPaid = false,
-                                Timestamp = DateTime.UtcNow,
-                                Amount = amountSats,
-                                CurrencyGiven = false
-                            };
-                            LogBuyInvoice(logEntry);
-                        }
-                    });
+                    ScheduleInvoiceExpiry(pendingInvoice);
                 }
                 else
                 {
@@ -829,56 +842,28 @@ namespace Oxide.Plugins
                 return;
             }
 
-            int amountSats = VipPrice;
+            int amountSats = vipPrice;
 
-            CreateInvoice(amountSats, $"Buying VIP Status", invoiceResponse =>
+            CreateInvoice(amountSats, "Buying VIP Status", invoiceResponse =>
             {
                 if (invoiceResponse != null)
                 {
-                    // Send the invoice via Discord webhook
-                    SendInvoiceToDiscord(player, invoiceResponse.PaymentRequest, amountSats, $"Buying VIP Status");
+                    SendInvoiceToDiscord(player, invoiceResponse.PaymentRequest, amountSats, "Buying VIP Status");
 
-                    // Notify the player in chat to check the Discord channel
-                    player.Reply(Lang("InvoiceCreatedCheckDiscord", player.Id, DiscordChannelName));
+                    player.Reply(Lang("InvoiceCreatedCheckDiscord", player.Id, discordChannelName));
 
-                    // Add the pending invoice
                     var pendingInvoice = new PendingInvoice
                     {
-                        RHash = BitConverter.ToString(invoiceResponse.RHash.Data).Replace("-", "").ToLower(),
+                        RHash = invoiceResponse.PaymentHash.ToLower(),
                         Player = player,
                         Amount = amountSats,
-                        Memo = $"Buying VIP Status",
+                        Memo = "Buying VIP Status",
                         CreatedAt = DateTime.UtcNow,
                         Type = PurchaseType.Vip
                     };
                     pendingInvoices.Add(pendingInvoice);
 
-                    // Start checking the invoice status after a delay
-                    timer.Once(RetryDelaySeconds, () =>
-                    {
-                        CheckPendingInvoices();
-                    });
-
-                    // Expire invoice after timeout if unpaid
-                    timer.Once(InvoiceTimeoutSeconds, () =>
-                    {
-                        if (pendingInvoices.Contains(pendingInvoice))
-                        {
-                            pendingInvoices.Remove(pendingInvoice);
-                            PrintWarning($"VIP purchase invoice for player {player.Id} expired.");
-
-                            var logEntry = new BuyInvoiceLogEntry
-                            {
-                                SteamID = player.Id,
-                                InvoiceID = pendingInvoice.RHash,
-                                IsPaid = false,
-                                Timestamp = DateTime.UtcNow,
-                                Amount = amountSats,
-                                VipGranted = false
-                            };
-                            LogBuyInvoice(logEntry);
-                        }
-                    });
+                    ScheduleInvoiceExpiry(pendingInvoice);
                 }
                 else
                 {
@@ -887,194 +872,108 @@ namespace Oxide.Plugins
             });
         }
 
-        private bool IsLightningAddressBlacklisted(string lightningAddress)
+        private void ScheduleInvoiceExpiry(PendingInvoice pendingInvoice)
         {
-            string domain = GetDomainFromLightningAddress(lightningAddress);
-            if (string.IsNullOrEmpty(domain))
-                return false;
-
-            return BlacklistedDomains.Contains(domain.ToLower());
-        }
-
-        private string GetDomainFromLightningAddress(string lightningAddress)
-        {
-            if (string.IsNullOrEmpty(lightningAddress))
-                return null;
-
-            var parts = lightningAddress.Split('@');
-            if (parts.Length != 2)
-                return null;
-
-            return parts[1].ToLower();
-        }
-
-        private void QueryLightningAddressForInvoice(string lightningAddress, int satsAmount, Action<string> callback)
-        {
-            string[] parts = lightningAddress.Split('@');
-            if (parts.Length != 2)
+            timer.Once(invoiceTimeoutSeconds, () =>
             {
-                PrintError($"Invalid Lightning address: {lightningAddress}");
-                callback(null);
-                return;
-            }
-
-            string username = parts[0];
-            string domain = parts[1];
-            string lnurlUrl = $"https://{domain}/.well-known/lnurlp/{username}";
-
-            Puts($"Querying Lightning address: {lightningAddress} for {satsAmount} sat invoice at URL: {lnurlUrl}");
-
-            webrequest.Enqueue(lnurlUrl, null, (code, response) =>
-            {
-                if (code != 200 || string.IsNullOrEmpty(response))
+                if (pendingInvoices.Contains(pendingInvoice))
                 {
-                    PrintError($"Error querying LNURL: HTTP {code}");
-                    PrintError($"Response: {response}");
-                    callback(null);
-                    return;
-                }
+                    pendingInvoices.Remove(pendingInvoice);
+                    PrintWarning($"Invoice for player {GetPlayerId(pendingInvoice.Player)} expired (amount: {pendingInvoice.Amount} sats).");
 
-                try
-                {
-                    var lnurlResponse = JsonConvert.DeserializeObject<Dictionary<string, object>>(response);
+                    int finalRetryCount = retryCounts.ContainsKey(pendingInvoice.RHash) ? retryCounts[pendingInvoice.RHash] : 0;
 
-                    if (lnurlResponse.ContainsKey("status") && lnurlResponse["status"].ToString() == "ERROR")
+                    if (pendingInvoice.Type == PurchaseType.SendBitcoin)
                     {
-                        PrintError($"Error from LNURL provider: {lnurlResponse["reason"]}");
-                        callback(null);
-                        return;
-                    }
+                        var basePlayer = pendingInvoice.Player.Object as BasePlayer;
+                        if (basePlayer != null)
+                        {
+                            ReturnCurrency(basePlayer, pendingInvoice.Amount / satsPerCurrencyUnit);
+                            Puts($"Refunded {pendingInvoice.Amount / satsPerCurrencyUnit} {currencyName} to player {basePlayer.UserIDString} due to failed payment.");
+                        }
+                        else
+                        {
+                            PrintError($"Failed to find base player object for player {pendingInvoice.Player.Id} to refund currency.");
+                        }
 
-                    string callbackUrl = lnurlResponse["callback"].ToString();
-                    callback($"{callbackUrl}?amount={satsAmount * 1000}"); // Amount in millisatoshis
-                }
-                catch (Exception ex)
-                {
-                    PrintError($"Failed to parse LNURL response: {ex.Message}");
-                    callback(null);
-                }
-            }, this, RequestMethod.GET);
-        }
-
-        private void SendPayment(string invoiceUrl, string token, int satsAmount, IPlayer player, string lightningAddress, Action<bool> callback)
-        {
-            Puts($"Fetching invoice from: {invoiceUrl}");
-
-            webrequest.Enqueue(invoiceUrl, null, (code, response) =>
-            {
-                if (code != 200 || string.IsNullOrEmpty(response))
-                {
-                    PrintError($"Error fetching invoice: HTTP {code}");
-                    PrintError($"Response: {response}");
-                    callback(false);
-                    return;
-                }
-
-                try
-                {
-                    var invoiceResponse = JsonConvert.DeserializeObject<Dictionary<string, object>>(response);
-
-                    if (invoiceResponse.ContainsKey("pr"))
-                    {
-                        string paymentRequest = invoiceResponse["pr"].ToString();
-                        Puts($"Fetched payment request: {paymentRequest}");
-
-                        ProcessPayment(paymentRequest, token, satsAmount, player, lightningAddress, callback);
+                        var logEntry = new SellInvoiceLogEntry
+                        {
+                            SteamID = GetPlayerId(pendingInvoice.Player),
+                            LightningAddress = ExtractLightningAddress(pendingInvoice.Memo),
+                            Success = false,
+                            SatsAmount = pendingInvoice.Amount,
+                            PaymentHash = pendingInvoice.RHash,
+                            CurrencyReturned = true,
+                            Timestamp = DateTime.UtcNow,
+                            RetryCount = finalRetryCount
+                        };
+                        LogSellTransaction(logEntry);
+                        Puts($"Invoice {pendingInvoice.RHash} for player {GetPlayerId(pendingInvoice.Player)} expired and logged.");
                     }
                     else
                     {
-                        PrintError("Invalid invoice response from LNURL provider");
-                        callback(false);
+                        var logEntry = CreateBuyInvoiceLogEntry(
+                            player: pendingInvoice.Player,
+                            invoiceID: pendingInvoice.RHash,
+                            isPaid: false,
+                            amount: pendingInvoice.Type == PurchaseType.SendBitcoin ? pendingInvoice.Amount : pendingInvoice.Amount * pricePerCurrencyUnit,
+                            type: pendingInvoice.Type,
+                            retryCount: finalRetryCount
+                        );
+                        LogBuyInvoice(logEntry);
+                        Puts($"Invoice {pendingInvoice.RHash} for player {GetPlayerId(pendingInvoice.Player)} expired and logged.");
                     }
                 }
-                catch (Exception ex)
-                {
-                    PrintError($"Failed to parse invoice response: {ex.Message}");
-                    callback(false);
-                }
-            }, this, RequestMethod.GET);
+            });
         }
 
-        private void ProcessPayment(string paymentRequest, string token, int satsAmount, IPlayer player, string lightningAddress, Action<bool> callback)
+        private void SendPayment(string bolt11, int satsAmount, Action<bool, string> callback)
         {
-            string url = $"{config.BaseUrl}/payinvoice";
-
+            string url = $"{config.BaseUrl}/api/v1/payments";
             var requestBody = new
             {
-                invoice = paymentRequest,
+                @out = true,
+                bolt11 = bolt11,
+                amount = satsAmount
             };
             string jsonBody = JsonConvert.SerializeObject(requestBody);
 
             var headers = new Dictionary<string, string>
             {
-                { "Authorization", $"Bearer {token}" },
+                { "X-Api-Key", config.ApiKey },
                 { "Content-Type", "application/json" }
             };
 
-            Puts($"Payment request URL: {url}");
-            Puts($"Payment request headers: {string.Join(", ", headers)}");
-
-            webrequest.Enqueue(url, jsonBody, (code, response) =>
+            MakeWebRequest(url, jsonBody, (code, response) =>
             {
-                if (code != 200 || string.IsNullOrEmpty(response))
+                if (code != 200 && code != 201)
                 {
                     PrintError($"Error processing payment: HTTP {code}");
-                    PrintError($"Response: {response}");
-                    callback(false);
+                    callback(false, null);
                     return;
                 }
 
                 try
                 {
-                    // Log the raw response before parsing
-                    Puts($"Raw payment response: {response}");
-
                     var paymentResponse = JsonConvert.DeserializeObject<Dictionary<string, object>>(response);
+                    string paymentHash = paymentResponse.ContainsKey("payment_hash") ? paymentResponse["payment_hash"].ToString() : null;
 
-                    // Check for errors in the response
-                    if (paymentResponse.ContainsKey("error") && paymentResponse["error"] != null)
+                    if (!string.IsNullOrEmpty(paymentHash))
                     {
-                        PrintError($"Payment failed: {paymentResponse["error"]}");
-                        callback(false);
-                        return;
+                        callback(true, paymentHash);
                     }
-
-                    // Safely extract and log fee and fee_msat if they exist
-                    int fee = 0;
-                    if (paymentResponse.ContainsKey("fee") && paymentResponse["fee"] is long)
+                    else
                     {
-                        fee = (int)(long)paymentResponse["fee"]; // Safe cast to handle long types
+                        PrintError("Payment hash (rhash) is missing or invalid in the response.");
+                        callback(false, null);
                     }
-                    else if (paymentResponse.ContainsKey("fee"))
-                    {
-                        Puts($"Unexpected fee type: {paymentResponse["fee"]?.GetType()}");
-                    }
-
-                    int feeMsat = 0;
-                    if (paymentResponse.ContainsKey("fee_msat") && paymentResponse["fee_msat"] is long)
-                    {
-                        feeMsat = (int)(long)paymentResponse["fee_msat"]; // Safe cast to handle long types
-                    }
-                    else if (paymentResponse.ContainsKey("fee_msat"))
-                    {
-                        Puts($"Unexpected fee_msat type: {paymentResponse["fee_msat"]?.GetType()}");
-                    }
-
-                    string paymentHash = paymentResponse.ContainsKey("payment_hash") ? paymentResponse["payment_hash"].ToString() : "unknown";
-
-                    Puts($"Payment processed successfully. Fee: {fee} msats, Fee (msat): {feeMsat}, Payment Hash: {paymentHash}");
-
-                    // Log the successful transaction
-                    LogSellTransaction(player.Id, lightningAddress, true, satsAmount, fee, feeMsat, paymentRequest, paymentHash, false);
-                    callback(true);
                 }
                 catch (Exception ex)
                 {
-                    PrintError($"Failed to parse payment response: {ex.Message}");
-                    PrintError($"Raw response: {response}");
-                    callback(false);
+                    PrintError($"Exception occurred while parsing payment response: {ex.Message}");
+                    callback(false, null);
                 }
-            }, this, RequestMethod.POST, headers);
+            }, RequestMethod.POST, headers);
         }
 
         private void SendInvoiceToDiscord(IPlayer player, string invoice, int amountSats, string memo)
@@ -1095,32 +994,23 @@ namespace Oxide.Plugins
                     new
                     {
                         title = "Payment Invoice",
-                        description = $"{memo}\n\nPlease pay the following Lightning invoice to complete your purchase:\n\n```{invoice}```",
+                        description = $"{memo}\n\nPlease pay the following Lightning invoice to complete your purchase:\n\n```\n{invoice}\n```",
                         image = new
                         {
                             url = qrCodeUrl
                         },
                         fields = new[]
                         {
-                            new
-                            {
-                                name = "Amount",
-                                value = $"{amountSats} sats",
-                                inline = true
-                            },
-                            new
-                            {
-                                name = "Steam ID",
-                                value = player.Id,
-                                inline = true
-                            }
+                            new { name = "Amount", value = $"{amountSats} sats", inline = true },
+                            new { name = "Steam ID", value = GetPlayerId(player), inline = true }
                         }
                     }
                 }
             };
 
             string jsonPayload = JsonConvert.SerializeObject(webhookPayload);
-            webrequest.Enqueue(config.DiscordWebhookUrl, jsonPayload, (code, response) =>
+
+            MakeWebRequest(config.DiscordWebhookUrl, jsonPayload, (code, response) =>
             {
                 if (code != 204)
                 {
@@ -1128,33 +1018,33 @@ namespace Oxide.Plugins
                 }
                 else
                 {
-                    Puts($"Invoice sent to Discord for player {player.Id}.");
+                    Puts($"Invoice sent to Discord for player {GetPlayerId(player)}.");
                 }
-            }, this, RequestMethod.POST, new Dictionary<string, string> { { "Content-Type", "application/json" } });
+            }, RequestMethod.POST, new Dictionary<string, string> { { "Content-Type", "application/json" } });
         }
 
         private void RewardPlayer(IPlayer player, int amount)
         {
-            player.Reply($"You have successfully purchased {amount} {CurrencyName}!");
+            player.Reply($"You have successfully purchased {amount} {currencyName}!");
 
             var basePlayer = player.Object as BasePlayer;
 
             if (basePlayer != null)
             {
-                var currencyItem = ItemManager.CreateByItemID(CurrencyItemID, amount);
+                var currencyItem = ItemManager.CreateByItemID(currencyItemID, amount);
                 if (currencyItem != null)
                 {
-                    if (CurrencySkinID > 0) // Check if a skinID is defined and apply it
+                    if (currencySkinID > 0)
                     {
-                        currencyItem.skin = (ulong)CurrencySkinID;
+                        currencyItem.skin = currencySkinID;
                     }
 
                     basePlayer.GiveItem(currencyItem);
-                    Puts($"Gave {amount} {CurrencyName} (skinID: {CurrencySkinID}) to player {player.Id}.");
+                    Puts($"Gave {amount} {currencyName} (skinID: {currencySkinID}) to player {basePlayer.UserIDString}.");
                 }
                 else
                 {
-                    PrintError($"Failed to create {CurrencyName} item for player {player.Id}.");
+                    PrintError($"Failed to create {currencyName} item for player {basePlayer.UserIDString}.");
                 }
             }
             else
@@ -1167,74 +1057,73 @@ namespace Oxide.Plugins
         {
             player.Reply("You have successfully purchased VIP status!");
 
-            // Add the player to the VIP permission group
-            permission.AddUserGroup(player.Id, VipPermissionGroup);
+            permission.AddUserGroup(player.Id, vipPermissionGroup);
 
-            Puts($"Player {player.Id} added to VIP group '{VipPermissionGroup}'.");
+            Puts($"Player {GetPlayerId(player)} added to VIP group '{vipPermissionGroup}'.");
         }
 
-        private int ReserveCurrency(BasePlayer player, int amount)
+        private bool TryReserveCurrency(BasePlayer player, int amount)
         {
-            var items = player.inventory.FindItemsByItemID(CurrencyItemID);
+            var items = GetAllInventoryItems(player).Where(IsCurrencyItem).ToList();
+            int totalCurrency = items.Sum(item => item.amount);
+
+            if (totalCurrency < amount)
+            {
+                return false;
+            }
+
             int remaining = amount;
-            int reserved = 0;
 
             foreach (var item in items)
             {
                 if (item.amount > remaining)
                 {
                     item.UseItem(remaining);
-                    reserved += remaining;
-                    remaining = 0;
                     break;
                 }
                 else
                 {
-                    reserved += item.amount;
                     remaining -= item.amount;
                     item.Remove();
                 }
+
+                if (remaining <= 0)
+                {
+                    break;
+                }
             }
 
-            if (remaining > 0)
-            {
-                // Rollback if unable to remove the full amount
-                PrintWarning($"Could not reserve the full amount of {CurrencyName}. {remaining} remaining.");
-                ReturnCurrency(player, reserved); // Return whatever was taken
-                return 0; // Indicate failure to reserve
-            }
-
-            return reserved; // Return the amount actually reserved
+            return true;
         }
 
         private void ReturnCurrency(BasePlayer player, int amount)
         {
-            var returnedCurrency = ItemManager.CreateByItemID(CurrencyItemID, amount);
+            var returnedCurrency = ItemManager.CreateByItemID(currencyItemID, amount);
             if (returnedCurrency != null)
             {
+                if (currencySkinID > 0)
+                {
+                    returnedCurrency.skin = currencySkinID;
+                }
                 returnedCurrency.MoveToContainer(player.inventory.containerMain);
+            }
+            else
+            {
+                PrintError($"Failed to create {currencyName} item to return to player {player.UserIDString}.");
             }
         }
 
-        private void LogSellTransaction(string steamID, string lightningAddress, bool success, int satsAmount, int fee, int feeMsat, string paymentRequest, string paymentHash, bool currencyReturned)
+        private bool IsCurrencyItem(Item item)
         {
-            var logEntry = new SellInvoiceLogEntry
-            {
-                SteamID = steamID,
-                LightningAddress = lightningAddress,
-                Success = success,
-                SatsAmount = satsAmount, // Store sats sent
-                Fee = fee, // Store fee
-                FeeMsat = feeMsat, // Store fee in millisatoshis
-                PaymentRequest = paymentRequest, // Store BOLT11 payment request
-                PaymentHash = paymentHash, // Store payment hash
-                CurrencyReturned = currencyReturned, // Indicates if currency was returned
-                Timestamp = DateTime.UtcNow
-            };
+            return item.info.itemid == currencyItemID && (currencySkinID == 0 || item.skin == currencySkinID);
+        }
 
+        private void LogSellTransaction(SellInvoiceLogEntry logEntry)
+        {
             var logs = LoadSellLogData();
             logs.Add(logEntry);
             SaveSellLogData(logs);
+            Puts($"[Orangemart] Logged sell transaction: {JsonConvert.SerializeObject(logEntry)}");
         }
 
         private List<SellInvoiceLogEntry> LoadSellLogData()
@@ -1262,58 +1151,51 @@ namespace Oxide.Plugins
             if (!Directory.Exists(directory))
                 Directory.CreateDirectory(directory);
 
-            List<BuyInvoiceLogEntry> invoiceLogs;
-
-            if (File.Exists(logPath))
-            {
-                invoiceLogs = JsonConvert.DeserializeObject<List<BuyInvoiceLogEntry>>(File.ReadAllText(logPath)) ?? new List<BuyInvoiceLogEntry>();
-            }
-            else
-            {
-                invoiceLogs = new List<BuyInvoiceLogEntry>();
-            }
+            List<BuyInvoiceLogEntry> invoiceLogs = File.Exists(logPath)
+                ? JsonConvert.DeserializeObject<List<BuyInvoiceLogEntry>>(File.ReadAllText(logPath)) ?? new List<BuyInvoiceLogEntry>()
+                : new List<BuyInvoiceLogEntry>();
 
             invoiceLogs.Add(logEntry);
             File.WriteAllText(logPath, JsonConvert.SerializeObject(invoiceLogs, Formatting.Indented));
+            Puts($"[Orangemart] Logged buy invoice: {JsonConvert.SerializeObject(logEntry)}");
+        }
+
+        private BuyInvoiceLogEntry CreateBuyInvoiceLogEntry(IPlayer player, string invoiceID, bool isPaid, int amount, PurchaseType type, int retryCount)
+        {
+            return new BuyInvoiceLogEntry
+            {
+                SteamID = GetPlayerId(player),
+                InvoiceID = invoiceID,
+                IsPaid = isPaid,
+                Timestamp = DateTime.UtcNow,
+                Amount = type == PurchaseType.SendBitcoin ? amount : amount * pricePerCurrencyUnit,
+                CurrencyGiven = isPaid && type == PurchaseType.Currency,
+                VipGranted = isPaid && type == PurchaseType.Vip,
+                RetryCount = retryCount
+            };
         }
 
         private void CreateInvoice(int amountSats, string memo, Action<InvoiceResponse> callback)
         {
-            if (string.IsNullOrEmpty(authToken))
-            {
-                GetAuthToken(token =>
-                {
-                    if (!string.IsNullOrEmpty(token))
-                    {
-                        CreateInvoice(amountSats, memo, callback); // Retry after getting token
-                    }
-                    else
-                    {
-                        callback(null);
-                    }
-                });
-                return;
-            }
+            string url = $"{config.BaseUrl}/api/v1/payments";
 
-            string url = $"{config.BaseUrl}/addinvoice";
             var requestBody = new
             {
-                amt = amountSats,
+                @out = false,
+                amount = amountSats,
                 memo = memo
             };
             string jsonBody = JsonConvert.SerializeObject(requestBody);
 
             var headers = new Dictionary<string, string>
             {
-                { "Authorization", $"Bearer {authToken}" },
+                { "X-Api-Key", config.ApiKey },
                 { "Content-Type", "application/json" }
             };
 
-            webrequest.Enqueue(url, jsonBody, (code, response) =>
+            MakeWebRequest(url, jsonBody, (code, response) =>
             {
-                PrintWarning($"Raw LNDHub response: {response}");
-
-                if (code != 200 || string.IsNullOrEmpty(response))
+                if (code != 200 && code != 201)
                 {
                     PrintError($"Error creating invoice: HTTP {code}");
                     callback(null);
@@ -1323,16 +1205,161 @@ namespace Oxide.Plugins
                 try
                 {
                     var invoiceResponse = JsonConvert.DeserializeObject<InvoiceResponse>(response);
-                    string rHashString = BitConverter.ToString(invoiceResponse.RHash.Data).Replace("-", "").ToLower();
-                    PrintWarning($"Parsed r_hash: {rHashString}");
-
-                    callback(invoiceResponse);
+                    callback(invoiceResponse != null && !string.IsNullOrEmpty(invoiceResponse.PaymentHash) ? invoiceResponse : null);
                 }
                 catch (Exception ex)
                 {
                     PrintError($"Failed to deserialize invoice response: {ex.Message}");
+                    callback(null);
                 }
-            }, this, RequestMethod.POST, headers);
+            }, RequestMethod.POST, headers);
+        }
+
+        private string GetPlayerId(IPlayer player)
+        {
+            var basePlayer = player.Object as BasePlayer;
+            return basePlayer != null ? basePlayer.UserIDString : player.Id;
+        }
+
+        private void MakeWebRequest(string url, string jsonData, Action<int, string> callback, RequestMethod method = RequestMethod.GET, Dictionary<string, string> headers = null)
+        {
+            webrequest.Enqueue(url, jsonData, (code, response) =>
+            {
+                if (string.IsNullOrEmpty(response) && (code < 200 || code >= 300))
+                {
+                    PrintError($"Web request to {url} returned empty response or HTTP {code}");
+                    callback(code, null);
+                }
+                else
+                {
+                    callback(code, response);
+                }
+            }, this, method, headers ?? new Dictionary<string, string> { { "Content-Type", "application/json" } });
+        }
+
+        private void ResolveLightningAddress(string lightningAddress, int amountSats, Action<string> callback)
+        {
+            var parts = lightningAddress.Split('@');
+            if (parts.Length != 2)
+            {
+                PrintError($"Invalid Lightning Address format: {lightningAddress}");
+                callback(null);
+                return;
+            }
+
+            string user = parts[0];
+            string domain = parts[1];
+
+            string lnurlEndpoint = $"https://{domain}/.well-known/lnurlp/{user}";
+
+            var headers = new Dictionary<string, string>
+            {
+                { "Content-Type", "application/json" }
+            };
+
+            MakeWebRequest(lnurlEndpoint, null, (code, response) =>
+            {
+                if (code != 200 || string.IsNullOrEmpty(response))
+                {
+                    PrintError($"Failed to fetch LNURL for {lightningAddress}: HTTP {code}");
+                    callback(null);
+                    return;
+                }
+
+                try
+                {
+                    var lnurlResponse = JsonConvert.DeserializeObject<LNURLResponse>(response);
+                    if (lnurlResponse == null || string.IsNullOrEmpty(lnurlResponse.Callback))
+                    {
+                        PrintError($"Invalid LNURL response for {lightningAddress}");
+                        callback(null);
+                        return;
+                    }
+
+                    long amountMsat = (long)amountSats * 1000;
+
+                    string callbackUrl = lnurlResponse.Callback;
+
+                    string callbackUrlWithAmount = $"{callbackUrl}?amount={amountMsat}";
+
+                    MakeWebRequest(callbackUrlWithAmount, null, (payCode, payResponse) =>
+                    {
+                        if (payCode != 200 || string.IsNullOrEmpty(payResponse))
+                        {
+                            PrintError($"Failed to perform LNURL Pay for {lightningAddress}: HTTP {payCode}");
+                            callback(null);
+                            return;
+                        }
+
+                        try
+                        {
+                            var payAction = JsonConvert.DeserializeObject<LNURLPayResponse>(payResponse);
+                            if (payAction == null || string.IsNullOrEmpty(payAction.Pr))
+                            {
+                                PrintError($"Invalid LNURL Pay response for {lightningAddress}");
+                                callback(null);
+                                return;
+                            }
+
+                            callback(payAction.Pr);
+                        }
+                        catch (Exception ex)
+                        {
+                            PrintError($"Error parsing LNURL Pay response: {ex.Message}");
+                            callback(null);
+                        }
+                    }, RequestMethod.GET, headers);
+                }
+                catch (Exception ex)
+                {
+                    PrintError($"Error parsing LNURL response: {ex.Message}");
+                    callback(null);
+                }
+            }, RequestMethod.GET, headers);
+        }
+
+        private class LNURLResponse
+        {
+            [JsonProperty("tag")]
+            public string Tag { get; set; }
+
+            [JsonProperty("callback")]
+            public string Callback { get; set; }
+
+            [JsonProperty("minSendable")]
+            public long MinSendable { get; set; }
+
+            [JsonProperty("maxSendable")]
+            public long MaxSendable { get; set; }
+
+            [JsonProperty("metadata")]
+            public string Metadata { get; set; }
+
+            [JsonProperty("commentAllowed")]
+            public int CommentAllowed { get; set; }
+
+            [JsonProperty("allowsNostr")]
+            public bool AllowsNostr { get; set; }
+
+            [JsonProperty("nostrPubkey")]
+            public string NostrPubkey { get; set; }
+        }
+
+        private class LNURLPayResponse
+        {
+            [JsonProperty("pr")]
+            public string Pr { get; set; }
+
+            [JsonProperty("routes")]
+            public List<object> Routes { get; set; }
+        }
+
+        private string ExtractLightningAddress(string memo)
+        {
+            // Extract the Lightning Address from the memo
+            // Expected format: "Sending {amount} {currency} to {lightning_address}"
+            var parts = memo.Split(" to ");
+            return parts.Length == 2 ? parts[1] : "unknown@unknown.com";
         }
     }
 }
