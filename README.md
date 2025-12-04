@@ -1,115 +1,54 @@
-## Overview:
-The **Orangemart** plugin allows players on your Rust server to buy and sell in-game units and VIP status using Bitcoin payments through the Lightning Network. This plugin integrates LNBits into the game, enabling secure transactions for game items and services.
 
----
+
+# Orangemart (v0.5.0)
+
+**Orangemart** is a [Rust plugin](https://umod.org/) that bridges your game server with the real-world Bitcoin Lightning Network. It allows players to buy in-game items, send currency to other players (withdrawals), and purchase VIP status using instant Lightning payments via an LNbits backend.
+
+## ⚡ New in v0.5.0
+
+  * **Instant Transactions:** Now uses **WebSockets** for real-time payment detection (no more waiting for polling).
+  * **Smart Expiry:** Discord invoices now automatically update to show "EXPIRED" status when timed out.
+  * **Protection Suite:** Added rate limiting, max transaction caps, and overflow protection to prevent abuse.
+  * **Crash Prevention:** Fully thread-safe item handling to prevent server stalls.
+
+-----
 
 ## Features
 
-- **In-Game Currency Purchase:** Players can purchase in-game currency using Bitcoin payments.
-- **Send In-Game Currency:** Players can send currency to others, facilitating peer-to-peer transactions.
-- **VIP Status Purchase:** Players can purchase VIP status through Bitcoin payments, unlocking special privileges.
-- **Configurable:** Server admins can set up command names, currency items, prices, and more through the configuration file.
+  * **Real-Time Deposits (`/buyblood`):** Players generate a QR code (linked to Discord) to buy in-game currency. Payments are detected instantly via WebSockets.
+  * **Withdrawals (`/sendblood`):** Players can "burn" in-game items to send real Sats to any Lightning Address (e.g., Wallet of Satoshi, Strike, CashApp).
+  * **VIP Automation:** Purchase VIP status / permissions automatically with Bitcoin.
+  * **Discord Integration:** Sends beautiful embed invoices to a designated Discord channel.
+  * **Anti-Abuse:** Configurable cooldowns, per-player transaction limits, and pending invoice caps.
 
----
+-----
 
 ## Commands
 
-The following commands are available to players:
+### Player Commands
 
-- **`/buyblood`**  
-  Players can purchase in-game currency using Bitcoin. The amount purchased is configurable.
+  * **`/buyblood <amount>`**
+    Generates a Lightning invoice to purchase in-game currency.
 
-- **`/sendblood <amount> <targetPlayer>`**  
-  Players can send a specified amount of in-game currency to another player.
+      * *Example:* `/buyblood 100`
 
-- **`/buyvip`**  
-  Players can purchase VIP status using Bitcoin. The VIP price and associated permission group are configurable.
+  * **`/sendblood <amount> <lightning_address>`**
+    Destroys in-game currency and sends real Bitcoin to the specified Lightning Address.
 
----
+      * *Example:* `/sendblood 50 user@walletofsatoshi.com`
 
-# Orangemart Plugin Configuration
+  * **`/buyvip`**
+    Generates an invoice to purchase VIP status (runs the configured console command upon success).
 
-Below is a comprehensive list of key configuration variables that can be customized in the **Orangemart** plugin. 
-These settings allow you to tailor the plugin's behavior to fit your server's requirements.
+-----
 
 ## Configuration
 
-#### Commands
+The configuration file allows you to set connection details, pricing, and security limits.
 
-- **`BuyCurrencyCommandName`**
-  - The command players use to purchase in-game currency. For example, `/buyblood`.
+### Default Configuration (`oxide/config/Orangemart.json`)
 
-- **`SendCurrencyCommandName`**
-  - The command players use to send in-game currency to other players. For example, `/sendblood`.
-
-- **`BuyVipCommandName`**
-  - The command players use to purchase VIP status. For example, `/buyvip`.
-
-#### Currency Settings
-
-- **`CurrencyItemID`**
-  - The item ID used for in-game currency transactions.
-
-- **`CurrencyName`**
-  - The name of the in-game currency displayed to players.
-
-- **`CurrencySkinID`**
-  - The skin ID applied to the in-game currency items. Set to `0` for default skin.
-
-- **`SatsPerCurrencyUnit`**
-  - The conversion rate between satoshis and in-game currency units. Determines how many satoshis equal one unit of in-game currency.
-
-- **`PricePerCurrencyUnit`**
-  - The price (in satoshis) per unit of in-game currency.
-
-#### Discord Integration
-
-- **`DiscordChannelName`**
-  - The name of the Discord channel where payment invoices will be posted.
-
-- **`DiscordWebhookUrl`**
-  - The Discord webhook URL used to send invoice notifications to the specified channel.
-
-#### Invoice Settings
-
-- **`BlacklistedDomains`**
-  - A list of domains that are disallowed for use in Lightning addresses. Players cannot send currency to addresses from these domains.
-
-- **`WhitelistedDomains`**
-  - A list of domains that are exclusively allowed for use in Lightning addresses. If this list is populated, only addresses from these domains are permitted.
-
-- **`CheckIntervalSeconds`**
-  - The interval time (in seconds) for checking pending Bitcoin transactions.
-
-- **`InvoiceTimeoutSeconds`**
-  - The time (in seconds) after which an unpaid invoice expires.
-
-- **`LNbitsApiKey`**
-  - The API key for authenticating with your LNbits instance.
-
-- **`LNbitsBaseUrl`**
-  - The base URL of your LNbits instance.
-
-- **`MaxRetries`**
-  - The maximum number of retry attempts for checking invoice payments before considering them expired.
-
-#### VIP Settings
-
-Configure the VIP status purchase and permissions.
-
-- **`VipPermissionGroup`**
-  - The Oxide permission group that players are added to upon purchasing VIP status.
-
-- **`VipPrice`**
-  - The price (in satoshis) for players to purchase VIP status.
-
----
-
-### Example Configuration Snippet
-
-Here's how the configuration might look in your `config.json`:
-
-```
+```json
 {
   "Commands": {
     "BuyCurrencyCommandName": "buyblood",
@@ -121,78 +60,85 @@ Here's how the configuration might look in your `config.json`:
     "CurrencyName": "blood",
     "CurrencySkinID": 0,
     "PricePerCurrencyUnit": 1,
-    "SatsPerCurrencyUnit": 1
+    "SatsPerCurrencyUnit": 1,
+    "MaxPurchaseAmount": 10000,
+    "MaxSendAmount": 10000,
+    "CommandCooldownSeconds": 0,
+    "MaxPendingInvoicesPerPlayer": 1
   },
   "Discord": {
     "DiscordChannelName": "mart",
     "DiscordWebhookUrl": "https://discord.com/api/webhooks/your_webhook_url"
   },
   "InvoiceSettings": {
-    "BlacklistedDomains": ["example.com", "blacklisted.net"],
+    "BlacklistedDomains": [
+      "example.com",
+      "blacklisted.net"
+    ],
     "WhitelistedDomains": [],
     "CheckIntervalSeconds": 10,
     "InvoiceTimeoutSeconds": 300,
     "LNbitsApiKey": "your-lnbits-admin-api-key",
     "LNbitsBaseUrl": "https://your-lnbits-instance.com",
-    "MaxRetries": 25
+    "MaxRetries": 25,
+    "UseWebSockets": true,
+    "WebSocketReconnectDelay": 5
   },
   "VIPSettings": {
-    "VipPermissionGroup": "vip",
+    "VipCommand": "oxide.usergroup add {steamid} vip",
     "VipPrice": 1000
   }
 }
 ```
 
-**Note:**  
-- Ensure that all URLs and API keys are correctly set to match your server and LNbits configurations.
-- Adjust the `BlacklistedDomains` and `WhitelistedDomains` according to your server's policies regarding Lightning addresses.
+### Key Settings Explained
 
----
+#### 🛡️ Protection Settings (New)
+
+  * **`MaxPurchaseAmount`**: The maximum amount of items a player can buy in one go.
+  * **`MaxSendAmount`**: The maximum amount a player can withdraw/send in one go.
+  * **`CommandCooldownSeconds`**: Time (in seconds) a player must wait between commands. Set to `0` to disable.
+  * **`MaxPendingInvoicesPerPlayer`**: Prevents players from spamming the server with unpaid invoices.
+
+#### ⚡ Invoice Settings
+
+  * **`UseWebSockets`**: Set to `true` for instant payment detection. If `false`, it falls back to slower polling.
+  * **`LNbitsBaseUrl`**: Your LNbits server URL (e.g., `https://legend.lnbits.com`).
+  * **`LNbitsApiKey`**: The **Admin Key** from your LNbits wallet.
+
+#### 👑 VIP Settings
+
+  * **`VipCommand`**: The console command to run when payment is successful. Supports placeholders:
+      * `{player}` - Player Name
+      * `{steamid}` - Steam ID (UserID)
+
+-----
 
 ## Installation
 
-1. **Download the Plugin**  
-   Place the `Orangemart.cs` file in your server's `oxide/plugins` folder.
+1.  **Prerequisites:** You must have an [LNbits](https://github.com/lnbits/lnbits) wallet instance running (or use a hosted one like https://www.google.com/search?q=legend.lnbits.com).
+2.  **Download:** Place `Orangemart.cs` into your `oxide/plugins` folder.
+3.  **Config:** Edit `oxide/config/Orangemart.json` and add your **LNbits API Key** and **Discord Webhook URL**.
+4.  **Reload:** Run `o.reload Orangemart`.
 
-2. **Configuration**  
-   Modify the plugin’s configuration file to fit your server’s settings (currency item, prices, VIP group, etc.). The configuration file will be automatically generated upon running the plugin for the first time.
-
-3. **Create VIP Group (Optional)**  
-   Create a VIP group to assign permssions to.
-   
-4. **Reload the Plugin**  
-   Once configured, reload the plugin using the command:  
-   ```  
-   oxide.reload Orangemart  
-   ```
-
----
+-----
 
 ## Permissions
 
-The plugin uses the following permissions:
+  * **`orangemart.buycurrency`** - Allows players to use `/buyblood`
+  * **`orangemart.sendcurrency`** - Allows players to use `/sendblood`
+  * **`orangemart.buyvip`** - Allows players to use `/buyvip`
 
-- **`orangemart.buycurrency`**  
-  Grants permission to players who are allowed to buy your currency item via Bitcoin.
+-----
 
-- **`orangemart.sendcurrency`**  
-  Grants permission to players who are allowed to send Bitcoin for your in-game currency unit.
+## Troubleshooting
 
-- **`orangemart.buyvip`**  
-  Grants permission to players to purchase VIP via Bitcoin.
+  * **Invoices not appearing in Discord?**
+    Check that your `DiscordWebhookUrl` is correct and that the plugin has loaded without errors in the server console.
+  * **Payments not registering instantly?**
+    Ensure `UseWebSockets` is set to `true` and that your server can connect to your LNbits instance via port 443 (HTTPS/WSS).
+  * **"Inventory Full" messages?**
+    If a player pays while their inventory is full, the item will drop at their feet.
 
----
+-----
 
-## Logging and Troubleshooting
-
-- **Logs:**  
-  Transaction details, such as purchases and currency sends, are logged for auditing purposes. Logs can be found in the `oxide/data/Orangemart` directory.
-
-- **Troubleshooting:**  
-  If any issues arise, check the server logs for errors related to the plugin. Ensure that the configuration file is correctly set up and that Bitcoin payment services are running as expected.
-
----
-
-## License
-
-This plugin is licensed under the MIT License.
