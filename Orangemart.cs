@@ -1534,8 +1534,10 @@ namespace Oxide.Plugins
                 var basePlayer = pendingInvoice.Player.Object as BasePlayer;
                 if (basePlayer != null) 
                 {
-                    ReturnCurrency(basePlayer, pendingInvoice.Amount / satsPerCurrencyUnit);
-                    pendingInvoice.Player.Reply("Payment timed out. Your currency has been refunded.");
+                    // Removed Automatic Refunds - Dangerous when dealing with HTLC's that can't be cancelled.
+                    // ReturnCurrency(basePlayer, pendingInvoice.Amount / satsPerCurrencyUnit);
+                    pendingInvoice.Player.Reply("Payment is delayed. If it takes more than a few hours please open a ticket in Discord.");
+                    Puts($"[ALERT] Outbound payment stuck for {pendingInvoice.Player.Name}. Hash: {pendingInvoice.RHash}. Do NOT refund unless confirmed failed in LNbits.");
                 }
                 UpdateSellTransactionStatus(pendingInvoice.TransactionId, TransactionStatus.EXPIRED, false, reason, true);
             }
